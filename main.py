@@ -24,9 +24,14 @@ from telebot import TeleBot, types
 # CONFIG
 # =====================================================
 
-BOT_TOKEN = "9132306088:AAGV_HIF2Z9ZmZLtEle3uvfAsSXx9b0jHbg"
-GEMINI_API_KEY = "AQ.Ab8RN6IK14PoO7JpdM1FxtyBk88kF_bH7Ce8wI4ZjL3nclTK_g"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN в переменных окружения")
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("Не задан GEMINI_API_KEY в переменных окружения")
 OWNER_ID = 8675927241
 
 BOT_NAME = "JARVIS"
