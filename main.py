@@ -1,16 +1,16 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-JARVIS 2.1
+JARVIS 2.2
 Telegram AI Assistant
-Gemini + SQLite + Backup
+Groq + SQLite + Backup
 """
 
 import os
 import re
 import time
-import shutil
 import sqlite3
 import threading
 import requests
@@ -24,19 +24,14 @@ from telebot import TeleBot, types
 # =====================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 BOT_NAME = "JARVIS"
-VERSION = "2.1"
+VERSION = "2.2"
 
-# Актуальная модель Gemini
-MODEL = "gemini-3.8-flash"
-
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{MODEL}:generateContent"
-)
+MODEL = "openai/gpt-oss-120b"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 DB_FILE = "jarvis.db"
 BACKUP_DIR = "jarvis_backups"
@@ -53,8 +48,8 @@ BACKUP_INTERVAL = 6 * 60 * 60
 if not BOT_TOKEN:
     raise SystemExit("Не задан BOT_TOKEN в переменных окружения.")
 
-if not GEMINI_API_KEY:
-    raise SystemExit("Не задан GEMINI_API_KEY в переменных окружения.")
+if not GROQ_API_KEY:
+    raise SystemExit("Не задан GROQ_API_KEY в переменных окружения.")
 
 if not OWNER_ID:
     print("[WARNING] OWNER_ID не задан. Команды владельца недоступны.")
@@ -297,7 +292,7 @@ def backup_worker():
 
 
 # =====================================================
-# GEMINI
+# AI SYSTEM PROMPT
 # =====================================================
 
 def system_prompt(user, chat):
@@ -343,16 +338,21 @@ def system_prompt(user, chat):
 """
 
 
-def parse_gemini_error(response):
-    """Получает понятное описание ошибки даже при не-JSON ответе."""
+# =====================================================
+# GROQ AI
+# =====================================================
 
+def parse_groq_error(response):
     try:
         data = response.json()
         error = data.get("error", {})
-        message = error.get("message")
 
-        if message:
-            return str(message)
+        if isinstance(error, dict):
+            message = error.get("message")
+            if message:
+                return str(message)
+
+        return str(error)[:1000]
 
     except (ValueError, AttributeError):
         pass
@@ -365,42 +365,47 @@ def parse_gemini_error(response):
     return body[:1000]
 
 
-def ask_gemini(chat_id, user, chat, text):
+def ask_groq(chat_id, user, chat, text):
     history = get_history(chat_id, user["user_id"])
 
-    contents = []
+    messages = [{
+        "role": "system",
+        "content": system_prompt(user, chat)
+    }]
 
     for item in history:
-        contents.append({
-            "role": item["role"],
-            "parts": [{"text": item["message"]}]
+        role = item["role"]
+
+        if role == "model":
+            role = "assistant"
+
+        if role not in ("user", "assistant"):
+            continue
+
+        messages.append({
+            "role": role,
+            "content": item["message"]
         })
 
-    contents.append({
+    messages.append({
         "role": "user",
-        "parts": [{"text": text}]
+        "content": text
     })
 
     payload = {
-        "systemInstruction": {
-            "parts": [{
-                "text": system_prompt(user, chat)
-            }]
-        },
-        "contents": contents,
-        "generationConfig": {
-            "temperature": 0.95,
-            "topP": 0.95,
-            "maxOutputTokens": MAX_OUTPUT
-        }
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.95,
+        "top_p": 0.95,
+        "max_completion_tokens": MAX_OUTPUT
     }
 
     try:
         response = requests.post(
-            GEMINI_URL,
+            GROQ_URL,
             headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": GEMINI_API_KEY
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
             },
             json=payload,
             timeout=90
@@ -408,83 +413,69 @@ def ask_gemini(chat_id, user, chat, text):
 
     except requests.exceptions.Timeout:
         raise RuntimeError(
-            "Gemini не ответил за отведённое время. Попробуй ещё раз."
+            "Groq не ответил за отведённое время. Попробуй ещё раз."
         )
 
     except requests.exceptions.ConnectionError:
         raise RuntimeError(
-            "Не удалось подключиться к Gemini. Проверь интернет хостинга."
+            "Не удалось подключиться к Groq. Проверь интернет хостинга."
         )
 
     except requests.exceptions.RequestException as e:
         raise RuntimeError(f"Ошибка соединения: {e}")
 
-    # Проверка HTTP-статуса и обработка ошибок API
     if not response.ok:
-        message = parse_gemini_error(response)
+        message = parse_groq_error(response)
+
+        if response.status_code == 429:
+            raise RuntimeError(
+                "Groq временно ограничил запросы (429).\n" + message
+            )
+
+        if response.status_code == 401:
+            raise RuntimeError(
+                "Groq не принял API-ключ. Проверь GROQ_API_KEY."
+            )
 
         raise RuntimeError(
-            f"Gemini API HTTP {response.status_code}: {message}"
+            f"Groq API HTTP {response.status_code}: {message}"
         )
 
-    # Безопасный разбор JSON
     try:
         data = response.json()
 
     except ValueError:
-        body = (response.text or "").strip()
-
         raise RuntimeError(
-            "Gemini вернул не JSON. "
-            f"HTTP {response.status_code}. "
-            f"Ответ: {body[:700] or 'Пустой ответ'}"
+            "Groq вернул некорректный JSON: "
+            + (response.text or "пустой ответ")[:500]
         )
 
-    if not isinstance(data, dict):
-        raise RuntimeError("Gemini вернул неожиданный формат ответа.")
+    choices = data.get("choices", [])
 
-    candidates = data.get("candidates", [])
-
-    if not candidates:
-        feedback = data.get("promptFeedback", {})
-        reason = feedback.get("blockReason")
-
-        if reason:
-            raise RuntimeError(
-                f"Запрос заблокирован фильтром Gemini: {reason}"
-            )
-
+    if not choices:
         raise RuntimeError(
-            "Gemini не вернул кандидатов ответа. "
-            f"Ответ API: {str(data)[:700]}"
+            "Groq не вернул ответ. " + str(data)[:700]
         )
 
-    candidate = candidates[0]
+    answer = (
+        choices[0]
+        .get("message", {})
+        .get("content", "")
+    )
 
-    finish_reason = candidate.get("finishReason", "")
-
-    if finish_reason == "SAFETY":
-        raise RuntimeError(
-            "Gemini не ответил из-за ограничений безопасности."
+    if isinstance(answer, list):
+        answer = "\n".join(
+            item.get("text", "")
+            for item in answer
+            if isinstance(item, dict)
         )
 
-    parts = candidate.get(
-        "content", {}
-    ).get("parts", [])
+    if not isinstance(answer, str) or not answer.strip():
+        raise RuntimeError("Groq вернул пустой ответ.")
 
-    answer = "\n".join(
-        p["text"]
-        for p in parts
-        if isinstance(p, dict) and isinstance(p.get("text"), str)
-    ).strip()
+    answer = answer.strip()
 
-    if not answer:
-        raise RuntimeError(
-            f"Gemini вернул пустой текст. Причина: "
-            f"{finish_reason or 'неизвестна'}"
-        )
-
-    # История и статистика обновляются только после успеха
+    # Сохраняем историю только после успешного ответа
     save_message(chat_id, user["user_id"], "user", text)
     save_message(chat_id, user["user_id"], "model", answer)
 
@@ -631,7 +622,7 @@ def ai_message(message, text):
     if user["banned"]:
         return "⛔ Доступ к ИИ ограничен."
 
-    return ask_gemini(
+    return ask_groq(
         message.chat.id,
         user,
         chat,
@@ -655,7 +646,7 @@ def cmd_start(m):
 
 Твой персональный ИИ-помощник.
 
-🧠 Gemini AI
+🧠 Groq AI
 🎭 Персонажи
 💾 Долговременная память
 📚 Обучение
@@ -749,10 +740,10 @@ def cmd_ai(m):
         send_long(m.chat.id, answer, m.message_id)
 
     except Exception as e:
-        print("[GEMINI ERROR]", repr(e))
+        print("[GROQ ERROR]", repr(e))
 
         bot.edit_message_text(
-            "⚠️ Ошибка Gemini:\n" + str(e)[:3000],
+            "⚠️ Ошибка Groq:\n" + str(e)[:3000],
             m.chat.id,
             thinking.message_id
         )
@@ -1019,7 +1010,7 @@ def cmd_adminstats(m):
         fetch=True
     )[0]["n"]
 
-    requests = query(
+    requests_count = query(
         "SELECT SUM(requests) AS n FROM users",
         fetch=True
     )[0]["n"] or 0
@@ -1029,7 +1020,7 @@ def cmd_adminstats(m):
 
 Пользователи: {users}
 Чаты: {chats}
-Запросы: {requests}
+Запросы: {requests_count}
 База: {DB_FILE}
 """)
 
@@ -1042,7 +1033,10 @@ def cmd_ban(m):
     parts = m.text.split()
 
     if len(parts) != 2 or not parts[1].isdigit():
-        return bot.reply_to(m, "Использование: /ban ID или /unban ID")
+        return bot.reply_to(
+            m,
+            "Использование: /ban ID или /unban ID"
+        )
 
     uid = int(parts[1])
 
@@ -1362,7 +1356,7 @@ def main():
     print("=" * 40)
     print("JARVIS", VERSION, "STARTED")
     print("Bot:", "@" + str(bot_username))
-    print("Gemini:", MODEL)
+    print("Groq:", MODEL)
     print("Database:", DB_FILE)
     print("Backup:", BACKUP_DIR)
     print("=" * 40)
