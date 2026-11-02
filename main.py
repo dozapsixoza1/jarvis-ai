@@ -31,7 +31,7 @@ BOT_NAME = "JARVIS"
 VERSION = "2.1"
 
 # Актуальная модель Gemini
-MODEL = "gemini-3.8-flash"
+MODEL = "gemini-2.5-flash"
 
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/"
