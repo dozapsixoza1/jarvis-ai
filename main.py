@@ -352,6 +352,37 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee_id, status);
         CREATE INDEX IF NOT EXISTS idx_reports_user ON reports(user_id, status);
         CREATE INDEX IF NOT EXISTS idx_tickets_status ON support_tickets(status);
+        
+        CREATE TABLE IF NOT EXISTS bugs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, description TEXT,
+            reporter_id INTEGER, assignee_id INTEGER, priority TEXT DEFAULT 'medium',
+            status TEXT DEFAULT 'open', created TEXT, updated TEXT, closed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS sprints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, goal TEXT, start_date TEXT,
+            end_date TEXT, status TEXT DEFAULT 'planned', created_by INTEGER, created TEXT
+        );
+        CREATE TABLE IF NOT EXISTS design_briefs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, description TEXT,
+            requester_id INTEGER, assignee_id INTEGER, status TEXT DEFAULT 'new',
+            deadline TEXT, created TEXT, updated TEXT
+        );
+        CREATE TABLE IF NOT EXISTS design_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, brief_id INTEGER, user_id INTEGER, text TEXT, created TEXT
+        );
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, description TEXT,
+            status TEXT DEFAULT 'planned', start_date TEXT, end_date TEXT,
+            created_by INTEGER, created TEXT
+        );
+        CREATE TABLE IF NOT EXISTS pr_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER, title TEXT, content TEXT,
+            status TEXT DEFAULT 'draft', author_id INTEGER, published_at TEXT, created TEXT
+        );
+        CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, author_id INTEGER, created TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_hr_status ON hr_applications(status);
         """)
         db.commit()
@@ -1154,31 +1185,38 @@ def cmd_ahelp(m):
     if not is_owner(m.from_user.id):
         return bot.reply_to(m, "⛔ Команда только для владельца.")
     bot.send_message(m.chat.id, f"""
-🛡 АДМИН-КОМАНДЫ JARVIS {VERSION}
+🛡 АДМИН + 7 ОТДЕЛОВ JARVIS {VERSION}
 
-Владелец:
-/backup — сделать бэкап базы
-/adminstats — общая статистика
-/ban ID — забанить пользователя
-/unban ID — разбанить
-/hire USER_ID dept role — принять/назначить
-/fire USER_ID dept — снять с должности
+Владелец: /backup /adminstats /ban /unban
+/hire USER_ID dept role /fire USER_ID dept
+/auto_on /auto_off /bot_on /bot_off /clearlearning
 
-Создание задач (руководитель отдела):
-/newtask dept USER_ID priority | заголовок | описание | YYYY-MM-DD
+SUPPORT: /tickets_all /ticket_view ID /ticket_take ID
+/ticket_reply ID текст /ticket_close ID /ticket_reopen ID /ticket_assign ID UID
 
-Управление в группах:
-/auto_on — автообщение
-/auto_off — только по упоминанию
-/bot_on — включить бота в чате
-/bot_off — выключить бота в чате
-/clearlearning — очистить обучение в чате
+REPORTS: /reports [dept] /report_view ID
+/report_approve ID /report_reject ID причина
 
-Коды отделов:
-admin, dev, design, pr, control, support, hr
+HR: /hr_list /hr_view ID /hr_accept ID
+/hr_reject ID причина /hr_interview ID результат
 
-Роли:
-leader, deputy, employee
+CONTROL: /checks /check_create dept UID тип | описание
+/check_view ID /check_close ID результат
+
+DEV: /bugs /bug_create title | desc /bug_view ID /bug_take ID /bug_close ID
+/sprints /sprint_create name | goal | start | end
+
+DESIGN: /briefs /brief_create title | desc /brief_view ID
+/brief_take ID /brief_done ID /brief_feedback ID текст
+
+PR: /campaigns /campaign_create title | desc /campaign_view ID
+/post_create CAMP_ID title | text /posts
+
+ADMIN: /announce title | text /announcements
+
+/warn USER_ID dept причина /mydept /members код /tasks_dept код
+Коды: admin dev design pr control support hr
+Роли: leader deputy employee
 """.strip())
 
 
@@ -1654,6 +1692,631 @@ def cmd_newtask(m):
     deadline = rest_parts[2] if len(rest_parts) > 2 else None
     tid = create_task(dept, title, description, m.from_user.id, assignee, prio, deadline)
     bot.reply_to(m, f"✅ Задача #{tid} создана и назначена.")
+
+
+
+# =====================================================
+# EXTRA DEPARTMENT COMMANDS (all 7)
+# =====================================================
+
+@bot.message_handler(commands=["mydept"])
+def cmd_mydept(m):
+    rows = query("SELECT department,role FROM department_members WHERE user_id=?", (m.from_user.id,), True)
+    if not rows:
+        return bot.reply_to(m, "Вы не состоите ни в одном отделе.")
+    text = "🏢 МОИ ОТДЕЛЫ\n\n" + "\n".join(
+        f"• {DEPARTMENTS.get(r['department'], (r['department'],))[0]} — {ROLES.get(r['role'], r['role'])}" for r in rows)
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(commands=["members"])
+def cmd_members(m):
+    parts = m.text.split()
+    if len(parts) < 2 or parts[1].lower() not in DEPARTMENTS:
+        return bot.reply_to(m, "/members код\nКоды: " + ", ".join(DEPARTMENTS))
+    dept = parts[1].lower()
+    mems = list_members(dept)
+    text = f"👥 {DEPARTMENTS[dept][0]}\n\n"
+    for mem in mems:
+        text += f"• {mem['first_name']} (@{mem['username'] or '—'}) — {ROLES.get(mem['role'], mem['role'])} [{mem['user_id']}]\n"
+    bot.send_message(m.chat.id, text[:4000] if mems else text + "Пусто.")
+
+@bot.message_handler(commands=["dept_stats"])
+def cmd_dept_stats(m):
+    parts = m.text.split()
+    if len(parts) < 2 or parts[1].lower() not in DEPARTMENTS:
+        return bot.reply_to(m, "/dept_stats код")
+    d = parts[1].lower()
+    a,b,c,e = department_stats(d)
+    bot.send_message(m.chat.id, f"📊 {DEPARTMENTS[d][0]}\nУчастников: {a}\nОткрытых задач: {b}\nВыполнено: {c}\nОтчётов: {e}")
+
+@bot.message_handler(commands=["tasks_dept"])
+def cmd_tasks_dept(m):
+    parts = m.text.split()
+    if len(parts) < 2 or parts[1].lower() not in DEPARTMENTS:
+        return bot.reply_to(m, "/tasks_dept код")
+    d = parts[1].lower()
+    if not is_in_department(m.from_user.id, d):
+        return bot.reply_to(m, "Вы не в этом отделе.")
+    rows = query("SELECT * FROM tasks WHERE department=? ORDER BY id DESC LIMIT 25", (d,), True)
+    text = f"📋 {DEPARTMENTS[d][0]}\n\n" + "\n".join(
+        f"#{r['id']} [{TASK_STATUSES.get(r['status'], r['status'])}] {r['title'][:50]}" for r in rows) if rows else "Пусто"
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["task_comment"])
+def cmd_task_comment(m):
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/task_comment ID текст")
+    tid, text = int(parts[1]), parts[2]
+    task = get_task(tid)
+    if not task:
+        return bot.reply_to(m, "Задача не найдена.")
+    add_task_comment(tid, m.from_user.id, text)
+    notify(task["assignee_id"], "💬", f"#{tid}: {text[:150]}")
+    bot.reply_to(m, "✅")
+
+@bot.message_handler(commands=["warn"])
+def cmd_warn(m):
+    parts = m.text.split(maxsplit=3)
+    if len(parts) < 4:
+        return bot.reply_to(m, "/warn USER_ID dept причина")
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        return bot.reply_to(m, "USER_ID число")
+    dept, reason = parts[2].lower(), parts[3]
+    if dept not in DEPARTMENTS:
+        return bot.reply_to(m, "Неизвестный отдел")
+    if not is_leader_or_deputy(m.from_user.id, dept) and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    query("INSERT INTO warnings(user_id,department,by_user,reason,created) VALUES(?,?,?,?,?)",
+          (uid, dept, m.from_user.id, reason[:500], datetime.now().isoformat()))
+    notify(uid, "⚠️", f"{DEPARTMENTS[dept][0]}: {reason[:200]}")
+    bot.reply_to(m, "⚠️ OK")
+
+@bot.message_handler(commands=["myreports"])
+def cmd_myreports(m):
+    rows = query("SELECT * FROM reports WHERE user_id=? ORDER BY id DESC LIMIT 15", (m.from_user.id,), True)
+    if not rows:
+        return bot.reply_to(m, "Нет отчётов.")
+    text = "📝\n" + "\n".join(f"#{r['id']} [{r['status']}] {r['report_type']} {r['department']}" for r in rows)
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(commands=["reports"])
+def cmd_reports(m):
+    parts = m.text.split()
+    dept = parts[1].lower() if len(parts) > 1 else None
+    if dept and dept not in DEPARTMENTS:
+        return bot.reply_to(m, "Неизвестный отдел")
+    if dept:
+        if not is_leader_or_deputy(m.from_user.id, dept) and not is_owner(m.from_user.id):
+            return bot.reply_to(m, "⛔")
+        rows = query("""SELECT r.*,u.first_name FROM reports r JOIN users u ON u.user_id=r.user_id
+                        WHERE r.department=? AND r.status='pending' ORDER BY r.id DESC LIMIT 20""", (dept,), True)
+    else:
+        rows = query("""SELECT r.*,u.first_name FROM reports r JOIN users u ON u.user_id=r.user_id
+                        JOIN department_members dm ON dm.department=r.department AND dm.user_id=?
+                        WHERE r.status='pending' AND dm.role IN ('leader','deputy')
+                        ORDER BY r.id DESC LIMIT 20""", (m.from_user.id,), True)
+        if is_owner(m.from_user.id) and not rows:
+            rows = query("""SELECT r.*,u.first_name FROM reports r JOIN users u ON u.user_id=r.user_id
+                            WHERE r.status='pending' ORDER BY r.id DESC LIMIT 20""", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет отчётов на проверку.")
+    text = "📝 НА ПРОВЕРКУ\n" + "\n".join(f"#{r['id']} [{r['report_type']}] {r['first_name']} {r['department']}" for r in rows)
+    text += "\n\n/report_view ID\n/report_approve ID\n/report_reject ID причина"
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["report_view"])
+def cmd_report_view(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/report_view ID")
+    rep = get_report(int(parts[1])) if 'get_report' in dir() else None
+    if not rep:
+        rows = query("SELECT * FROM reports WHERE id=?", (int(parts[1]),), True)
+        rep = rows[0] if rows else None
+    if not rep:
+        return bot.reply_to(m, "Не найден")
+    if not (is_leader_or_deputy(m.from_user.id, rep["department"]) or is_owner(m.from_user.id) or rep["user_id"] == m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    bot.send_message(m.chat.id, f"📝 #{rep['id']} {rep['report_type']} {rep['department']}\n{rep['content']}\nСтатус: {rep['status']}")
+
+@bot.message_handler(commands=["report_approve"])
+def cmd_report_approve(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/report_approve ID")
+    rid = int(parts[1])
+    rows = query("SELECT * FROM reports WHERE id=?", (rid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    rep = rows[0]
+    if not is_leader_or_deputy(m.from_user.id, rep["department"]) and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    review_report(rid, m.from_user.id, "approved", "Принято")
+    bot.reply_to(m, f"✅ #{rid}")
+
+@bot.message_handler(commands=["report_reject"])
+def cmd_report_reject(m):
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/report_reject ID причина")
+    rid, reason = int(parts[1]), parts[2]
+    rows = query("SELECT * FROM reports WHERE id=?", (rid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    rep = rows[0]
+    if not is_leader_or_deputy(m.from_user.id, rep["department"]) and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    review_report(rid, m.from_user.id, "rejected", reason)
+    bot.reply_to(m, f"❌ #{rid}")
+
+@bot.message_handler(commands=["tickets_all"])
+def cmd_tickets_all(m):
+    if not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Только поддержка")
+    rows = query("SELECT * FROM support_tickets WHERE status IN ('open','in_progress','reopened','answered') ORDER BY id DESC LIMIT 25", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет открытых тикетов")
+    text = "🎫\n" + "\n".join(f"#{t['id']} [{t['status']}] {t['subject'][:40]} u{t['user_id']}" for t in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["ticket_view"])
+def cmd_ticket_view(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/ticket_view ID")
+    rows = query("SELECT * FROM support_tickets WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    t = rows[0]
+    if t["user_id"] != m.from_user.id and not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    hist = query("SELECT th.*,u.first_name FROM ticket_history th LEFT JOIN users u ON u.user_id=th.user_id WHERE ticket_id=? ORDER BY id DESC LIMIT 12", (t["id"],), True)
+    text = f"🎫 #{t['id']} [{t['status']}]\n{t['subject']}\n{t['description']}\nАвтор: {format_user(t['user_id'])}\n"
+    text += "\n".join(f"• {h['first_name'] or h['user_id']}: {h['action']}" + (f" — {h['comment'][:60]}" if h["comment"] else "") for h in reversed(hist))
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["ticket_take"])
+def cmd_ticket_take(m):
+    if not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/ticket_take ID")
+    tid = int(parts[1])
+    rows = query("SELECT * FROM support_tickets WHERE id=?", (tid,), True)
+    if not rows or rows[0]["status"] == "closed":
+        return bot.reply_to(m, "Нельзя")
+    update_ticket(tid, m.from_user.id, "taken", "в работу", assignee_id=m.from_user.id, new_status="in_progress")
+    notify(rows[0]["user_id"], "🎫", f"#{tid} в работе")
+    bot.reply_to(m, f"✅ #{tid}")
+
+@bot.message_handler(commands=["ticket_reply"])
+def cmd_ticket_reply(m):
+    if not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/ticket_reply ID текст")
+    tid, reply = int(parts[1]), parts[2]
+    rows = query("SELECT * FROM support_tickets WHERE id=?", (tid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    t = rows[0]
+    update_ticket(tid, m.from_user.id, "reply", reply, new_status="answered")
+    notify(t["user_id"], f"🎫 #{tid}", reply[:500])
+    try:
+        bot.send_message(t["user_id"], f"🎫 Ответ #{tid}:\n{reply}")
+    except Exception:
+        pass
+    bot.reply_to(m, f"✅ #{tid}")
+
+@bot.message_handler(commands=["ticket_close"])
+def cmd_ticket_close(m):
+    if not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/ticket_close ID [причина]")
+    tid = int(parts[1])
+    reason = parts[2] if len(parts) > 2 else "Закрыто"
+    rows = query("SELECT * FROM support_tickets WHERE id=?", (tid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    update_ticket(tid, m.from_user.id, "closed", reason, new_status="closed")
+    notify(rows[0]["user_id"], f"🎫 #{tid} закрыт", reason[:200])
+    bot.reply_to(m, f"✅ #{tid}")
+
+@bot.message_handler(commands=["ticket_reopen"])
+def cmd_ticket_reopen(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/ticket_reopen ID")
+    tid = int(parts[1])
+    rows = query("SELECT * FROM support_tickets WHERE id=?", (tid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    t = rows[0]
+    if t["user_id"] != m.from_user.id and not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    update_ticket(tid, m.from_user.id, "reopened", "", new_status="reopened")
+    bot.reply_to(m, f"✅ #{tid}")
+
+@bot.message_handler(commands=["ticket_assign"])
+def cmd_ticket_assign(m):
+    if not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        return bot.reply_to(m, "/ticket_assign ID USER_ID")
+    tid, uid = int(parts[1]), int(parts[2])
+    rows = query("SELECT * FROM support_tickets WHERE id=?", (tid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    update_ticket(tid, m.from_user.id, "assigned", str(uid), assignee_id=uid, new_status="in_progress")
+    notify(uid, "🎫", f"#{tid}")
+    bot.reply_to(m, f"✅ #{tid} → {uid}")
+
+@bot.message_handler(commands=["hr_list"])
+def cmd_hr_list(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    rows = query("SELECT * FROM hr_applications ORDER BY id DESC LIMIT 20", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет заявок")
+    text = "📄\n" + "\n".join(f"#{a['id']} [{a['status']}] {a['full_name']} → {a['desired_department']}" for a in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["hr_view"])
+def cmd_hr_view(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/hr_view ID")
+    rows = query("SELECT * FROM hr_applications WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдена")
+    a = rows[0]
+    bot.send_message(m.chat.id, f"📄 #{a['id']}\n{a['full_name']}, {a['age']}\n{a['experience']}\n{a['skills']}\n→ {a['desired_department']}\n{a['status']}")
+
+@bot.message_handler(commands=["hr_accept"])
+def cmd_hr_accept(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/hr_accept ID")
+    aid = int(parts[1])
+    rows = query("SELECT * FROM hr_applications WHERE id=?", (aid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдена")
+    a = rows[0]
+    query("UPDATE hr_applications SET status='accepted',interviewer_id=?,updated=? WHERE id=?",
+          (m.from_user.id, datetime.now().isoformat(), aid))
+    add_member(a["user_id"], a["desired_department"], "employee", m.from_user.id, "HR")
+    notify(a["user_id"], "📄", f"Приняты в {a['desired_department']}")
+    bot.reply_to(m, f"✅ #{aid}")
+
+@bot.message_handler(commands=["hr_reject"])
+def cmd_hr_reject(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/hr_reject ID причина")
+    aid, reason = int(parts[1]), parts[2]
+    rows = query("SELECT * FROM hr_applications WHERE id=?", (aid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдена")
+    query("UPDATE hr_applications SET status='rejected',comment=?,updated=? WHERE id=?",
+          (reason[:500], datetime.now().isoformat(), aid))
+    notify(rows[0]["user_id"], "📄 Отклонено", reason[:300])
+    bot.reply_to(m, f"❌ #{aid}")
+
+@bot.message_handler(commands=["hr_interview"])
+def cmd_hr_interview(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/hr_interview ID результат")
+    aid, result = int(parts[1]), parts[2]
+    rows = query("SELECT * FROM hr_applications WHERE id=?", (aid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдена")
+    query("UPDATE hr_applications SET status='interview',interviewer_id=?,interview_result=?,updated=? WHERE id=?",
+          (m.from_user.id, result[:500], datetime.now().isoformat(), aid))
+    notify(rows[0]["user_id"], "📄", result[:300])
+    bot.reply_to(m, f"✅ #{aid}")
+
+@bot.message_handler(commands=["checks"])
+def cmd_checks(m):
+    if not is_in_department(m.from_user.id, "control") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    rows = query("SELECT * FROM control_checks ORDER BY id DESC LIMIT 20", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет")
+    text = "🔍\n" + "\n".join(f"#{c['id']} [{c['status']}] {c['check_type']} → {c['target_user']}" for c in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["check_create"])
+def cmd_check_create(m):
+    if not is_in_department(m.from_user.id, "control") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    text = m.text.partition(" ")[2].strip()
+    if "|" not in text:
+        return bot.reply_to(m, "/check_create dept UID тип | описание")
+    head, desc = text.split("|", 1)
+    parts = head.split()
+    if len(parts) < 3:
+        return bot.reply_to(m, "dept UID тип")
+    dept, us, ctype = parts[0].lower(), parts[1], parts[2]
+    if dept not in DEPARTMENTS:
+        return bot.reply_to(m, "Отдел?")
+    try:
+        target = int(us)
+    except ValueError:
+        return bot.reply_to(m, "UID число")
+    cid = create_check(dept, m.from_user.id, target, ctype, desc.strip())
+    bot.reply_to(m, f"✅ #{cid}")
+
+@bot.message_handler(commands=["check_view"])
+def cmd_check_view(m):
+    if not is_in_department(m.from_user.id, "control") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/check_view ID")
+    rows = query("SELECT * FROM control_checks WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдена")
+    c = rows[0]
+    bot.send_message(m.chat.id, f"🔍 #{c['id']}\n{c['check_type']} → {format_user(c['target_user'])}\n{c['description']}\n{c['result'] or '—'}")
+
+@bot.message_handler(commands=["check_close"])
+def cmd_check_close(m):
+    if not is_in_department(m.from_user.id, "control") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/check_close ID результат")
+    cid, result = int(parts[1]), parts[2]
+    rows = query("SELECT * FROM control_checks WHERE id=?", (cid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдена")
+    close_check(cid, result)
+    notify(rows[0]["target_user"], f"🔍 #{cid}", result[:300])
+    bot.reply_to(m, f"✅ #{cid}")
+
+@bot.message_handler(commands=["bugs"])
+def cmd_bugs(m):
+    if not is_in_department(m.from_user.id, "dev") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    rows = query("SELECT * FROM bugs WHERE status!='closed' ORDER BY id DESC LIMIT 20", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет")
+    text = "🐛\n" + "\n".join(f"#{b['id']} [{b['status']}/{b['priority']}] {b['title'][:50]}" for b in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["bug_create"])
+def cmd_bug_create(m):
+    if not is_in_department(m.from_user.id, "dev") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    c = m.text.partition(" ")[2]
+    if "|" not in c:
+        return bot.reply_to(m, "/bug_create title | desc")
+    title, desc = c.split("|", 1)
+    bid = query("INSERT INTO bugs(title,description,reporter_id,priority,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+                (title.strip()[:200], desc.strip()[:2000], m.from_user.id, "medium", "open", datetime.now().isoformat(), datetime.now().isoformat()))
+    bot.reply_to(m, f"✅ #{bid}")
+
+@bot.message_handler(commands=["bug_view"])
+def cmd_bug_view(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/bug_view ID")
+    rows = query("SELECT * FROM bugs WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    b = rows[0]
+    bot.send_message(m.chat.id, f"🐛 #{b['id']}\n{b['title']}\n{b['description']}\n{b['priority']} | {b['status']}")
+
+@bot.message_handler(commands=["bug_take"])
+def cmd_bug_take(m):
+    if not is_in_department(m.from_user.id, "dev") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/bug_take ID")
+    bid = int(parts[1])
+    query("UPDATE bugs SET assignee_id=?,status='in_progress',updated=? WHERE id=?", (m.from_user.id, datetime.now().isoformat(), bid))
+    bot.reply_to(m, f"✅ #{bid}")
+
+@bot.message_handler(commands=["bug_close"])
+def cmd_bug_close(m):
+    if not is_in_department(m.from_user.id, "dev") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/bug_close ID")
+    bid = int(parts[1])
+    query("UPDATE bugs SET status='closed',closed_at=?,updated=? WHERE id=?", (datetime.now().isoformat(), datetime.now().isoformat(), bid))
+    add_points(m.from_user.id, 8, f"Баг #{bid}")
+    bot.reply_to(m, f"✅ #{bid}")
+
+@bot.message_handler(commands=["sprints"])
+def cmd_sprints(m):
+    if not is_in_department(m.from_user.id, "dev") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    rows = query("SELECT * FROM sprints ORDER BY id DESC LIMIT 15", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет")
+    text = "📅\n" + "\n".join(f"#{s['id']} [{s['status']}] {s['name']}" for s in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["sprint_create"])
+def cmd_sprint_create(m):
+    if not is_leader_or_deputy(m.from_user.id, "dev") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    c = m.text.partition(" ")[2]
+    if c.count("|") < 3:
+        return bot.reply_to(m, "/sprint_create name | goal | start | end")
+    parts = [x.strip() for x in c.split("|")]
+    sid = query("INSERT INTO sprints(name,goal,start_date,end_date,status,created_by,created) VALUES(?,?,?,?,?,?,?)",
+                (parts[0][:100], parts[1][:500], parts[2], parts[3], "planned", m.from_user.id, datetime.now().isoformat()))
+    bot.reply_to(m, f"✅ #{sid}")
+
+@bot.message_handler(commands=["briefs"])
+def cmd_briefs(m):
+    if not is_in_department(m.from_user.id, "design") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    rows = query("SELECT * FROM design_briefs WHERE status!='done' ORDER BY id DESC LIMIT 20", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет")
+    text = "🎨\n" + "\n".join(f"#{b['id']} [{b['status']}] {b['title'][:50]}" for b in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["brief_create"])
+def cmd_brief_create(m):
+    c = m.text.partition(" ")[2]
+    if "|" not in c:
+        return bot.reply_to(m, "/brief_create title | desc")
+    title, desc = c.split("|", 1)
+    bid = query("INSERT INTO design_briefs(title,description,requester_id,status,created,updated) VALUES(?,?,?,?,?,?)",
+                (title.strip()[:200], desc.strip()[:2000], m.from_user.id, "new", datetime.now().isoformat(), datetime.now().isoformat()))
+    for x in query("SELECT user_id FROM department_members WHERE department='design'", fetch=True):
+        notify(x["user_id"], "🎨", f"#{bid}: {title[:80]}")
+    bot.reply_to(m, f"✅ #{bid}")
+
+@bot.message_handler(commands=["brief_view"])
+def cmd_brief_view(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/brief_view ID")
+    rows = query("SELECT * FROM design_briefs WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    b = rows[0]
+    bot.send_message(m.chat.id, f"🎨 #{b['id']}\n{b['title']}\n{b['description']}\n{b['status']}")
+
+@bot.message_handler(commands=["brief_take"])
+def cmd_brief_take(m):
+    if not is_in_department(m.from_user.id, "design") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/brief_take ID")
+    bid = int(parts[1])
+    query("UPDATE design_briefs SET assignee_id=?,status='in_progress',updated=? WHERE id=?", (m.from_user.id, datetime.now().isoformat(), bid))
+    bot.reply_to(m, f"✅ #{bid}")
+
+@bot.message_handler(commands=["brief_done"])
+def cmd_brief_done(m):
+    if not is_in_department(m.from_user.id, "design") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/brief_done ID")
+    bid = int(parts[1])
+    rows = query("SELECT * FROM design_briefs WHERE id=?", (bid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    query("UPDATE design_briefs SET status='done',updated=? WHERE id=?", (datetime.now().isoformat(), bid))
+    add_points(m.from_user.id, 12, f"Бриф #{bid}")
+    notify(rows[0]["requester_id"], "🎨 Готово", f"#{bid}")
+    bot.reply_to(m, f"✅ #{bid}")
+
+@bot.message_handler(commands=["brief_feedback"])
+def cmd_brief_feedback(m):
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/brief_feedback ID текст")
+    bid, text = int(parts[1]), parts[2]
+    query("INSERT INTO design_feedback(brief_id,user_id,text,created) VALUES(?,?,?,?)",
+          (bid, m.from_user.id, text[:1000], datetime.now().isoformat()))
+    bot.reply_to(m, "✅")
+
+@bot.message_handler(commands=["campaigns"])
+def cmd_campaigns(m):
+    if not is_in_department(m.from_user.id, "pr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    rows = query("SELECT * FROM campaigns ORDER BY id DESC LIMIT 15", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет")
+    text = "📢\n" + "\n".join(f"#{c['id']} [{c['status']}] {c['title']}" for c in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["campaign_create"])
+def cmd_campaign_create(m):
+    if not is_leader_or_deputy(m.from_user.id, "pr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    c = m.text.partition(" ")[2]
+    if "|" not in c:
+        return bot.reply_to(m, "/campaign_create title | desc")
+    title, desc = c.split("|", 1)
+    cid = query("INSERT INTO campaigns(title,description,status,created_by,created) VALUES(?,?,?,?,?)",
+                (title.strip()[:200], desc.strip()[:2000], "planned", m.from_user.id, datetime.now().isoformat()))
+    bot.reply_to(m, f"✅ #{cid}")
+
+@bot.message_handler(commands=["campaign_view"])
+def cmd_campaign_view(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/campaign_view ID")
+    rows = query("SELECT * FROM campaigns WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдена")
+    c = rows[0]
+    bot.send_message(m.chat.id, f"📢 #{c['id']}\n{c['title']}\n{c['description']}\n{c['status']}")
+
+@bot.message_handler(commands=["post_create"])
+def cmd_post_create(m):
+    if not is_in_department(m.from_user.id, "pr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    text = m.text.partition(" ")[2].strip()
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[0].isdigit() or "|" not in parts[1]:
+        return bot.reply_to(m, "/post_create CAMP_ID title | text")
+    cid = int(parts[0])
+    title, content = parts[1].split("|", 1)
+    pid = query("INSERT INTO pr_posts(campaign_id,title,content,status,author_id,created) VALUES(?,?,?,?,?,?)",
+                (cid, title.strip()[:200], content.strip()[:4000], "draft", m.from_user.id, datetime.now().isoformat()))
+    bot.reply_to(m, f"✅ #{pid}")
+
+@bot.message_handler(commands=["posts"])
+def cmd_posts(m):
+    if not is_in_department(m.from_user.id, "pr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    rows = query("SELECT * FROM pr_posts ORDER BY id DESC LIMIT 15", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет")
+    text = "📝\n" + "\n".join(f"#{p['id']} [{p['status']}] {p['title'][:50]}" for p in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["announce"])
+def cmd_announce(m):
+    if not is_leader_or_deputy(m.from_user.id, "admin") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    c = m.text.partition(" ")[2]
+    if "|" not in c:
+        return bot.reply_to(m, "/announce title | text")
+    title, body = c.split("|", 1)
+    aid = query("INSERT INTO announcements(title,body,author_id,created) VALUES(?,?,?,?)",
+                (title.strip()[:200], body.strip()[:3000], m.from_user.id, datetime.now().isoformat()))
+    for u in query("SELECT DISTINCT user_id FROM department_members", fetch=True):
+        notify(u["user_id"], f"📣 {title[:80]}", body[:300])
+    bot.reply_to(m, f"✅ #{aid}")
+
+@bot.message_handler(commands=["announcements"])
+def cmd_announcements(m):
+    rows = query("SELECT * FROM announcements ORDER BY id DESC LIMIT 10", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Нет")
+    text = "📣\n" + "\n\n".join(f"#{a['id']} {a['title']}\n{a['body'][:150]}" for a in rows)
+    bot.send_message(m.chat.id, text[:4000])
 
 
 # =====================================================
