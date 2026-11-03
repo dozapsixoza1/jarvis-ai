@@ -28,7 +28,40 @@ OWNER_ID = int(os.getenv("OWNER_ID", "8675927241"))
 BOT_NAME = "JARVIS"
 VERSION = "3.0"
 
-MODEL = "openai/gpt-oss-120b"
+# Multi-AI models (tried in order on failure)
+MODELS = [
+    "openai/gpt-oss-120b",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-70b-versatile",
+    "mixtral-8x7b-32768",
+    "gemma2-9b-it",
+]
+MODEL = MODELS[0]  # default
+
+# Daily limits: stronger model = fewer free requests
+MODEL_DAILY_LIMITS = {
+    "openai/gpt-oss-120b": 15,        # strongest
+    "llama-3.3-70b-versatile": 40,
+    "llama-3.1-70b-versatile": 60,
+    "mixtral-8x7b-32768": 80,
+    "gemma2-9b-it": 120,              # weakest / fastest
+}
+# Extra paid quota product grants more requests
+
+SHOP_PRODUCTS = {
+    "requests_50": {"title": "50 запросов ИИ", "price_stars": 50, "requests": 50},
+    "requests_200": {"title": "200 запросов ИИ", "price_stars": 150, "requests": 200},
+    "ad_1h": {"title": "Реклама 1 час", "price_stars": 100, "ad_hours": 1},
+    "ad_6h": {"title": "Реклама 6 часов", "price_stars": 400, "ad_hours": 6},
+    "ad_24h": {"title": "Реклама 24 часа", "price_stars": 1200, "ad_hours": 24},
+}
+
+ADS_CHANNEL = os.getenv("ADS_CHANNEL", "@jarvisainews").strip()  # e.g. @your_channel or -100id
+TON_WALLET = os.getenv("TON_WALLET", "UQDpae691AVgHN0mHd36T_NOwQ6C4SlMcl5koUeySqWHu52E").strip()    # for manual TON payments note
+IMAGE_API_KEY = os.getenv("IMAGE_API_KEY", "").strip()  # optional external
+TTS_ENABLED = os.getenv("TTS_ENABLED", "0").strip() == "1"
+
+
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 DB_FILE = "jarvis.db"
@@ -94,9 +127,12 @@ DEPARTMENTS = {
 }
 
 ROLES = {
+    "owner": "Владелец",
+    "deputy_owner": "Зам. владельца",
     "leader": "Руководитель",
     "deputy": "Заместитель",
-    "employee": "Сотрудник"
+    "employee": "Сотрудник",
+    "trainee": "Стажёр"
 }
 
 TASK_STATUSES = {
@@ -382,6 +418,88 @@ def init_db():
         CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, author_id INTEGER, created TEXT
         );
+        
+        
+        
+        CREATE TABLE IF NOT EXISTS usage_daily (
+            user_id INTEGER, day TEXT, model TEXT, count INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, day, model)
+        );
+        CREATE TABLE IF NOT EXISTS user_quota (
+            user_id INTEGER PRIMARY KEY, extra_requests INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS shop_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, product TEXT, amount_stars INTEGER,
+            status TEXT DEFAULT 'pending', payload TEXT, created TEXT, paid_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ads (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, text TEXT, hours INTEGER,
+            status TEXT DEFAULT 'active', started TEXT, ends TEXT,
+            message_ids TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            department TEXT, title TEXT, description TEXT,
+            status TEXT DEFAULT 'active', owner_id INTEGER,
+            created TEXT, updated TEXT
+        );
+        CREATE TABLE IF NOT EXISTS project_members (
+            project_id INTEGER, user_id INTEGER,
+            PRIMARY KEY(project_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS probation (
+            user_id INTEGER, department TEXT, started TEXT, ends TEXT,
+            status TEXT DEFAULT 'active', PRIMARY KEY(user_id, department)
+        );
+
+        CREATE TABLE IF NOT EXISTS department_points (
+            user_id INTEGER, department TEXT, points INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, department)
+        );
+        CREATE TABLE IF NOT EXISTS interviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id INTEGER, hr_id INTEGER, department TEXT,
+            status TEXT DEFAULT 'open', score INTEGER DEFAULT 0,
+            notes TEXT DEFAULT '', created TEXT, updated TEXT
+        );
+        CREATE TABLE IF NOT EXISTS interview_answers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            interview_id INTEGER, question TEXT, answer TEXT, created TEXT
+        );
+        CREATE TABLE IF NOT EXISTS ticket_ratings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER, user_id INTEGER, score INTEGER, comment TEXT, created TEXT
+        );
+        CREATE TABLE IF NOT EXISTS support_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT, body TEXT, author_id INTEGER, created TEXT
+        );
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, text TEXT, due_at TEXT, sent INTEGER DEFAULT 0, created TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, action TEXT, details TEXT, created TEXT
+        );
+        CREATE TABLE IF NOT EXISTS knowledge_base (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT, content TEXT, tags TEXT DEFAULT '',
+            author_id INTEGER, created TEXT, updated TEXT
+        );
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_type TEXT, title TEXT, body TEXT,
+            author_id INTEGER, status TEXT DEFAULT 'draft',
+            reviewer_id INTEGER, created TEXT, updated TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit ON audit_log(user_id, created);
+        CREATE INDEX IF NOT EXISTS idx_kb ON knowledge_base(title);
+
 
         CREATE INDEX IF NOT EXISTS idx_hr_status ON hr_applications(status);
         """)
@@ -479,6 +597,10 @@ def backup_worker():
         try:
             backup()
             print("[BACKUP] OK")
+            try:
+                cleanup_expired_ads()
+            except Exception as ce:
+                print("[ADS CLEAN]", ce)
         except Exception as e:
             print("[BACKUP ERROR]", repr(e))
 
@@ -540,88 +662,276 @@ def parse_groq_error(response):
     return body[:1000]
 
 
+
+
+# Баллы для авто-повышения внутри отдела (накопленные department_points)
+
+WARN_LIMIT = 3
+
+def count_warnings(user_id, department=None):
+    if department:
+        return query("SELECT COUNT(*) AS n FROM warnings WHERE user_id=? AND department=?", (user_id, department), True)[0]["n"]
+    return query("SELECT COUNT(*) AS n FROM warnings WHERE user_id=?", (user_id,), True)[0]["n"]
+
+def apply_warn_limit(user_id, department, by_user):
+    n = count_warnings(user_id, department)
+    if n >= WARN_LIMIT:
+        # restrict AI access
+        query("UPDATE users SET banned=1 WHERE user_id=?", (user_id,))
+        notify(user_id, "🚫 Ограничение", f"Получено {n} предупреждений. Доступ к ИИ ограничен.")
+        audit(by_user, "warn_limit_ban", f"user {user_id} dept {department} warns={n}")
+        return True
+    return False
+
+def start_probation(user_id, department, days=14):
+    from datetime import timedelta
+    start = datetime.now()
+    end = start + timedelta(days=days)
+    query("""INSERT INTO probation(user_id,department,started,ends,status) VALUES(?,?,?,?,?)
+             ON CONFLICT(user_id,department) DO UPDATE SET started=?,ends=?,status='active'""",
+          (user_id, department, start.isoformat(), end.isoformat(), "active",
+           start.isoformat(), end.isoformat()))
+    notify(user_id, "⏳ Испытательный срок", f"{DEPARTMENTS.get(department,(department,))[0]}: до {end.strftime('%Y-%m-%d')}")
+
+
+PROMO_THRESHOLDS = {
+    "trainee": 50,      # trainee -> employee
+    "employee": 150,    # employee -> deputy (если нет заместителя / по решению)
+    "deputy": 300,      # symbolic, leader only by hire
+}
+
+DEFAULT_INTERVIEW_QUESTIONS = [
+    "Расскажите о своём опыте",
+    "Почему хотите работать в этом отделе?",
+    "Какие сильные стороны?",
+    "Готовы ли к испытательному сроку?",
+]
+
+def add_dept_points(user_id, department, pts, reason=""):
+    if pts == 0 or not department:
+        return
+    query("""INSERT INTO department_points(user_id,department,points) VALUES(?,?,?)
+             ON CONFLICT(user_id,department) DO UPDATE SET points=points+?""",
+          (user_id, department, pts, pts))
+    if reason:
+        notify(user_id, "⭐ Баллы отдела", f"+{pts} в {DEPARTMENTS.get(department,(department,))[0]} — {reason}")
+    try_auto_promote(user_id, department)
+
+def get_dept_points(user_id, department):
+    rows = query("SELECT points FROM department_points WHERE user_id=? AND department=?", (user_id, department), True)
+    return rows[0]["points"] if rows else 0
+
+def try_auto_promote(user_id, department):
+    role = get_member_role(user_id, department)
+    if not role:
+        return
+    pts = get_dept_points(user_id, department)
+    # trainee -> employee
+    if role == "trainee" and pts >= PROMO_THRESHOLDS.get("trainee", 50):
+        add_member(user_id, department, "employee", 0, "Авто-повышение: trainee→employee")
+        audit(0, "auto_promote", f"{user_id} {department} trainee→employee ({pts} pts)")
+        notify(user_id, "⬆️ Повышение", f"Вы повышены до Сотрудника в отделе {DEPARTMENTS.get(department,(department,))[0]}")
+        grant_achievement(user_id, "Повышение", "Авто-повышение из стажёров", 20)
+    # employee -> deputy only if no deputy exists and high points (optional soft promote suggestion via notify to leaders)
+    elif role == "employee" and pts >= PROMO_THRESHOLDS.get("employee", 150):
+        deputies = query("SELECT user_id FROM department_members WHERE department=? AND role='deputy'", (department,), True)
+        if not deputies:
+            # notify leaders instead of auto-making deputy (safer)
+            for L in query("SELECT user_id FROM department_members WHERE department=? AND role IN ('leader','deputy_owner')", (department,), True):
+                notify(L["user_id"], "⬆️ Кандидат на заместителя",
+                       f"{format_user(user_id)} набрал {pts} баллов в {department}. Можно /hire {user_id} {department} deputy")
+
+
+
+def today_str():
+    return datetime.now().strftime("%Y-%m-%d")
+
+def get_model_usage(user_id, model):
+    rows = query("SELECT count FROM usage_daily WHERE user_id=? AND day=? AND model=?",
+                 (user_id, today_str(), model), True)
+    return rows[0]["count"] if rows else 0
+
+def inc_model_usage(user_id, model):
+    query("""INSERT INTO usage_daily(user_id,day,model,count) VALUES(?,?,?,1)
+             ON CONFLICT(user_id,day,model) DO UPDATE SET count=count+1""",
+          (user_id, today_str(), model))
+
+def get_extra_quota(user_id):
+    rows = query("SELECT extra_requests FROM user_quota WHERE user_id=?", (user_id,), True)
+    return rows[0]["extra_requests"] if rows else 0
+
+def consume_extra_quota(user_id, n=1):
+    extra = get_extra_quota(user_id)
+    if extra < n:
+        return False
+    query("UPDATE user_quota SET extra_requests=extra_requests-? WHERE user_id=?", (n, user_id))
+    return True
+
+def add_extra_quota(user_id, n):
+    query("""INSERT INTO user_quota(user_id,extra_requests) VALUES(?,?)
+             ON CONFLICT(user_id) DO UPDATE SET extra_requests=extra_requests+?""",
+          (user_id, n, n))
+
+def check_model_limit(user_id, model):
+    """Returns (allowed: bool, message: str)"""
+    limit = MODEL_DAILY_LIMITS.get(model, 50)
+    used = get_model_usage(user_id, model)
+    if used < limit:
+        return True, ""
+    # try paid quota
+    if get_extra_quota(user_id) > 0:
+        return True, "extra"
+    return False, f"Лимит {model.split('/')[-1]}: {used}/{limit} за сегодня. Купите пакет: /shop"
+
+
+def get_user_model(user):
+    """Return preferred model or default list"""
+    try:
+        pref = (user["preferred_model"] or "").strip()
+    except (KeyError, IndexError, TypeError):
+        pref = ""
+    if pref and pref in MODELS:
+        return [pref] + [m for m in MODELS if m != pref]
+    return list(MODELS)
+
 def ask_groq(chat_id, user, chat, text):
     history = get_history(chat_id, user["user_id"])
     messages = [{"role": "system", "content": system_prompt(user, chat)}]
     for item in history:
-        role = item["role"]
-        if role == "model":
-            role = "assistant"
-        if role not in ("user", "assistant"):
-            continue
-        messages.append({"role": role, "content": item["message"]})
+        role = "assistant" if item["role"] == "model" else item["role"]
+        if role in ("user", "assistant"):
+            messages.append({"role": role, "content": item["message"]})
     messages.append({"role": "user", "content": text})
 
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "temperature": 0.95,
-        "top_p": 0.95,
-        "max_completion_tokens": MAX_OUTPUT
-    }
+    models_to_try = get_user_model(user)
+    last_error = None
 
-    try:
-        response = requests.post(
-            GROQ_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=90
-        )
-    except requests.exceptions.Timeout:
-        raise RuntimeError("Groq не ответил за отведённое время. Попробуй ещё раз.")
-    except requests.exceptions.ConnectionError:
-        raise RuntimeError("Не удалось подключиться к Groq. Проверь интернет хостинга.")
-    except requests.exceptions.RequestException as e:
-        raise RuntimeError(f"Ошибка соединения: {e}")
+    use_extra = False
+    for current_model in models_to_try:
+        allowed, lim_msg = check_model_limit(user["user_id"], current_model)
+        if not allowed:
+            last_error = lim_msg
+            # try next weaker model instead of hard fail
+            continue
+        use_extra = (lim_msg == "extra")
 
-    if not response.ok:
-        message = parse_groq_error(response)
+        payload = {
+            "model": current_model,
+            "messages": messages,
+            "temperature": 0.95,
+            "top_p": 0.95,
+            "max_completion_tokens": MAX_OUTPUT
+        }
+        try:
+            response = requests.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json=payload,
+                timeout=90
+            )
+        except requests.exceptions.Timeout:
+            last_error = f"{current_model}: timeout"
+            print("[AI]", last_error)
+            continue
+        except requests.exceptions.ConnectionError:
+            last_error = f"{current_model}: connection error"
+            print("[AI]", last_error)
+            continue
+        except requests.exceptions.RequestException as e:
+            last_error = f"{current_model}: {e}"
+            print("[AI]", last_error)
+            continue
+
         if response.status_code == 429:
-            raise RuntimeError("Groq временно ограничил запросы (429).\n" + message)
+            last_error = f"{current_model}: rate limit 429"
+            print("[AI]", last_error)
+            continue
         if response.status_code == 401:
-            raise RuntimeError("Groq не принял API-ключ. Проверь GROQ_API_KEY.")
-        raise RuntimeError(f"Groq API HTTP {response.status_code}: {message}")
+            raise RuntimeError("Неверный GROQ_API_KEY")
+        if not response.ok:
+            try:
+                msg = response.json().get("error", {}).get("message", response.text)[:300]
+            except Exception:
+                msg = response.text[:300]
+            last_error = f"{current_model}: HTTP {response.status_code} — {msg}"
+            print("[AI]", last_error)
+            continue
 
-    try:
-        data = response.json()
-    except ValueError:
-        raise RuntimeError(
-            "Groq вернул некорректный JSON: "
-            + (response.text or "пустой ответ")[:500]
-        )
+        try:
+            data = response.json()
+        except ValueError:
+            last_error = f"{current_model}: invalid JSON"
+            continue
 
-    choices = data.get("choices", [])
-    if not choices:
-        raise RuntimeError("Groq не вернул ответ. " + str(data)[:700])
+        choices = data.get("choices") or []
+        if not choices:
+            last_error = f"{current_model}: empty choices"
+            continue
 
-    answer = choices[0].get("message", {}).get("content", "")
-    if isinstance(answer, list):
-        answer = "\n".join(
-            item.get("text", "") for item in answer if isinstance(item, dict)
-        )
-    if not isinstance(answer, str) or not answer.strip():
-        raise RuntimeError("Groq вернул пустой ответ.")
+        answer = choices[0].get("message", {}).get("content", "")
+        if isinstance(answer, list):
+            answer = "\n".join(x.get("text", "") for x in answer if isinstance(x, dict))
+        if not isinstance(answer, str) or not answer.strip():
+            last_error = f"{current_model}: empty content"
+            continue
 
-    answer = answer.strip()
-    save_message(chat_id, user["user_id"], "user", text)
-    save_message(chat_id, user["user_id"], "model", answer)
+        answer = answer.strip()
+        # success
+        if use_extra:
+            consume_extra_quota(user["user_id"], 1)
+        else:
+            inc_model_usage(user["user_id"], current_model)
+        save_message(chat_id, user["user_id"], "user", text)
+        save_message(chat_id, user["user_id"], "model", answer)
+        query("UPDATE users SET requests=requests+1 WHERE user_id=?", (user["user_id"],))
+        query("""INSERT INTO activity(user_id,chat_id,requests) VALUES(?,?,1)
+                 ON CONFLICT(user_id,chat_id) DO UPDATE SET requests=requests+1""",
+              (user["user_id"], chat_id))
+        return answer
 
-    query("UPDATE users SET requests=requests+1 WHERE user_id=?", (user["user_id"],))
-    query("""
-        INSERT INTO activity(user_id,chat_id,requests)
-        VALUES(?,?,1)
-        ON CONFLICT(user_id,chat_id)
-        DO UPDATE SET requests=requests+1
-    """, (user["user_id"], chat_id))
-    return answer
-
+    # all models failed
+    raise RuntimeError("Все модели недоступны. Последняя ошибка: " + str(last_error))
 
 # =====================================================
 # RIGHTS & HELPERS
 # =====================================================
+
+
+def audit(user_id, action, details=""):
+    query("INSERT INTO audit_log(user_id,action,details,created) VALUES(?,?,?,?)",
+          (user_id, action[:100], details[:500], datetime.now().isoformat()))
+
+def grant_achievement(user_id, title, description, points=5):
+    exists = query("SELECT id FROM achievements WHERE user_id=? AND title=?", (user_id, title), True)
+    if exists:
+        return False
+    query("INSERT INTO achievements(user_id,department,title,description,points,created) VALUES(?,?,?,?,?,?)",
+          (user_id, "", title[:100], description[:300], points, datetime.now().isoformat()))
+    add_points(user_id, points, title)
+    notify(user_id, "🎖 Достижение", f"{title} (+{points})")
+    return True
+
+def check_auto_achievements(user_id):
+    # tasks
+    done = query("SELECT COUNT(*) AS n FROM tasks WHERE assignee_id=? AND status='done'", (user_id,), True)[0]["n"]
+    if done >= 1:
+        grant_achievement(user_id, "Первая задача", "Выполнил первую задачу", 5)
+    if done >= 10:
+        grant_achievement(user_id, "10 задач", "Выполнил 10 задач", 15)
+    if done >= 50:
+        grant_achievement(user_id, "50 задач", "Выполнил 50 задач", 40)
+    # tickets answered/closed by support
+    closed = query("SELECT COUNT(*) AS n FROM ticket_history WHERE user_id=? AND action='closed'", (user_id,), True)[0]["n"]
+    if closed >= 10:
+        grant_achievement(user_id, "Поддержка 10+", "Закрыл 10+ тикетов", 20)
+    # reports
+    reps = query("SELECT COUNT(*) AS n FROM reports WHERE user_id=? AND status='approved'", (user_id,), True)[0]["n"]
+    if reps >= 5:
+        grant_achievement(user_id, "Отчётник", "5 принятых отчётов", 15)
+
 
 def is_owner(uid):
     return OWNER_ID != 0 and uid == OWNER_ID
@@ -647,7 +957,7 @@ def get_member_role(user_id, department):
 
 def is_leader_or_deputy(user_id, department):
     role = get_member_role(user_id, department)
-    return role in ("leader", "deputy") or is_owner(user_id)
+    return role in ("leader", "deputy", "deputy_owner", "owner") or is_owner(user_id)
 
 
 def is_in_department(user_id, department):
@@ -656,7 +966,7 @@ def is_in_department(user_id, department):
 
 def can_manage_members(user_id, department):
     role = get_member_role(user_id, department)
-    return role == "leader" or is_owner(user_id)
+    return role in ("leader", "deputy_owner", "owner") or is_owner(user_id)
 
 
 def notify(user_id, title, body):
@@ -831,6 +1141,12 @@ def add_member(user_id, department, role, by_user, comment=""):
         "appoint" if not old else "change", comment,
         datetime.now().isoformat()
     ))
+    audit(by_user, "hire", f"{user_id} -> {role} @{department}")
+    if role == "trainee":
+        try:
+            start_probation(user_id, department)
+        except Exception:
+            pass
     notify(user_id, "🏢 Назначение",
            f"Вы назначены на должность «{ROLES.get(role, role)}» в отдел «{DEPARTMENTS[department][0]}»")
 
@@ -998,6 +1314,10 @@ def review_report(report_id, reviewer_id, status, comment=""):
                f"Отчёт #{report_id} → {status}. {comment[:200]}")
         if status == "approved":
             add_points(rows[0]["user_id"], 5, f"Отчёт #{report_id}")
+            rep = query("SELECT department FROM reports WHERE id=?", (report_id,), True)
+            if rep:
+                add_dept_points(rows[0]["user_id"], rep[0]["department"], 5, f"Отчёт #{report_id}")
+            # need department from report - skip if complex
             query("UPDATE ratings SET reports_ok=reports_ok+1 WHERE user_id=?", (rows[0]["user_id"],))
 
 
@@ -1215,6 +1535,14 @@ PR: /campaigns /campaign_create title | desc /campaign_view ID
 ADMIN: /announce title | text /announcements
 
 /warn USER_ID dept причина /mydept /members код /tasks_dept код
+
+/kb /kb_add /kb_search /kb_view /kb_del
+/audit /cc /cabinet /points /promos /transfer
+/interview_start /interview_answer /interview_view /interview_score /interview_hire
+/templates /template_add /template_use /rate_ticket /remind /myreminders /overdue /digest /warnings
+/project_create /projects /project_view /project_join /project_done
+/probation /probation_end
+/doc_create /docs /doc_view /doc_approve /doc_reject
 Коды: admin dev design pr control support hr
 Роли: leader deputy employee
 """.strip())
@@ -1495,14 +1823,14 @@ def cmd_report(m):
     text = m.text.partition(" ")[2].strip()
     if not text:
         return bot.reply_to(m,
-            "Использование:\n/report daily|weekly отдел текст_отчёта\n\n"
+            "Использование:\n/report daily|weekly|monthly отдел текст_отчёта\n\n"
             "Пример:\n/report daily dev Сделал 3 задачи, исправил баги.")
     parts = text.split(maxsplit=2)
     if len(parts) < 3:
         return bot.reply_to(m, "Нужно: тип (daily/weekly) + код отдела + текст")
     rtype, dept, content = parts[0].lower(), parts[1].lower(), parts[2]
-    if rtype not in ("daily", "weekly"):
-        return bot.reply_to(m, "Тип: daily или weekly")
+    if rtype not in ("daily", "weekly", "monthly"):
+        return bot.reply_to(m, "Тип: daily / weekly / monthly")
     if dept not in DEPARTMENTS:
         return bot.reply_to(m, "Неизвестный отдел. Коды: " + ", ".join(DEPARTMENTS.keys()))
     if not is_in_department(m.from_user.id, dept):
@@ -1771,6 +2099,7 @@ def cmd_warn(m):
         return bot.reply_to(m, "⛔")
     query("INSERT INTO warnings(user_id,department,by_user,reason,created) VALUES(?,?,?,?,?)",
           (uid, dept, m.from_user.id, reason[:500], datetime.now().isoformat()))
+    apply_warn_limit(uid, dept, m.from_user.id)
     notify(uid, "⚠️", f"{DEPARTMENTS[dept][0]}: {reason[:200]}")
     bot.reply_to(m, "⚠️ OK")
 
@@ -1926,6 +2255,11 @@ def cmd_ticket_close(m):
     if not rows:
         return bot.reply_to(m, "Не найден")
     update_ticket(tid, m.from_user.id, "closed", reason, new_status="closed")
+    if rows[0].get("assignee_id") or rows[0]["assignee_id"]:
+        aid = rows[0]["assignee_id"]
+        if aid:
+            add_dept_points(aid, "support", 8, f"Закрыт тикет #{tid}")
+            check_auto_achievements(aid)
     notify(rows[0]["user_id"], f"🎫 #{tid} закрыт", reason[:200])
     bot.reply_to(m, f"✅ #{tid}")
 
@@ -2317,6 +2651,899 @@ def cmd_announcements(m):
         return bot.reply_to(m, "Нет")
     text = "📣\n" + "\n\n".join(f"#{a['id']} {a['title']}\n{a['body'][:150]}" for a in rows)
     bot.send_message(m.chat.id, text[:4000])
+
+
+
+@bot.message_handler(commands=["models"])
+def cmd_models(m):
+    text = "🧠 ДОСТУПНЫЕ МОДЕЛИ\n\n"
+    for i, model in enumerate(MODELS, 1):
+        text += f"{i}. `{model}`\n"
+    text += "\nВыбор: /model название_или_номер"
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(commands=["model"])
+def cmd_model(m):
+    arg = m.text.partition(" ")[2].strip()
+    if not arg:
+        u = get_user(m.from_user)
+        current = (u["preferred_model"] if "preferred_model" in u.keys() else "") or MODEL
+        return bot.reply_to(m, f"Текущая модель: `{current}`\nСписок: /models\nСменить: /model название")
+    # by number
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(MODELS):
+            chosen = MODELS[idx]
+        else:
+            return bot.reply_to(m, "Нет такой модели. /models")
+    else:
+        # partial match
+        matches = [m for m in MODELS if arg.lower() in m.lower()]
+        if not matches:
+            return bot.reply_to(m, "Модель не найдена. /models")
+        chosen = matches[0]
+    query("UPDATE users SET preferred_model=? WHERE user_id=?", (chosen, m.from_user.id))
+    bot.reply_to(m, f"✅ Модель установлена:\n`{chosen}`")
+
+
+
+# ===== KNOWLEDGE BASE / AUDIT / CC / DOCS =====
+
+@bot.message_handler(commands=["kb"])
+def cmd_kb(m):
+    rows = query("SELECT id,title,tags FROM knowledge_base ORDER BY id DESC LIMIT 20", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "База знаний пуста.\nДобавить: /kb_add заголовок | текст")
+    text = "📚 БАЗА ЗНАНИЙ\n\n" + "\n".join(f"#{r['id']} {r['title']}" + (f" [{r['tags']}]" if r['tags'] else "") for r in rows)
+    text += "\n\n/kb_view ID\n/kb_search запрос\n/kb_add заголовок | текст"
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["kb_add"])
+def cmd_kb_add(m):
+    if not is_owner(m.from_user.id) and not any(is_leader_or_deputy(m.from_user.id, d) for d in DEPARTMENTS):
+        # allow any department leader or owner
+        # simpler: owner or any leader
+        is_any_leader = query("SELECT 1 FROM department_members WHERE user_id=? AND role IN ('leader','deputy','deputy_owner','owner')", (m.from_user.id,), True)
+        if not is_any_leader and not is_owner(m.from_user.id):
+            return bot.reply_to(m, "⛔ Только руководители/владелец")
+    content = m.text.partition(" ")[2]
+    if "|" not in content:
+        return bot.reply_to(m, "/kb_add заголовок | текст")
+    title, body = content.split("|", 1)
+    kid = query("INSERT INTO knowledge_base(title,content,author_id,created,updated) VALUES(?,?,?,?,?)",
+                (title.strip()[:200], body.strip()[:4000], m.from_user.id, datetime.now().isoformat(), datetime.now().isoformat()))
+    audit(m.from_user.id, "kb_add", f"#{kid} {title[:50]}")
+    bot.reply_to(m, f"✅ Статья #{kid} добавлена")
+
+@bot.message_handler(commands=["kb_view"])
+def cmd_kb_view(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/kb_view ID")
+    rows = query("SELECT * FROM knowledge_base WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдена")
+    k = rows[0]
+    bot.send_message(m.chat.id, f"📚 #{k['id']} {k['title']}\n\n{k['content'][:3500]}")
+
+@bot.message_handler(commands=["kb_search"])
+def cmd_kb_search(m):
+    q = m.text.partition(" ")[2].strip()
+    if not q:
+        return bot.reply_to(m, "/kb_search запрос")
+    rows = query("SELECT id,title,content FROM knowledge_base WHERE title LIKE ? OR content LIKE ? OR tags LIKE ? ORDER BY id DESC LIMIT 10",
+                 (f"%{q}%", f"%{q}%", f"%{q}%"), True)
+    if not rows:
+        return bot.reply_to(m, "Ничего не найдено")
+    text = f"🔎 Поиск: {q}\n\n"
+    for r in rows:
+        snippet = (r["content"] or "")[:120].replace("\n", " ")
+        text += f"#{r['id']} {r['title']}\n{snippet}...\n\n"
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["kb_del"])
+def cmd_kb_del(m):
+    if not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Только владелец")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/kb_del ID")
+    query("DELETE FROM knowledge_base WHERE id=?", (int(parts[1]),))
+    audit(m.from_user.id, "kb_del", parts[1])
+    bot.reply_to(m, "🗑 Удалено")
+
+@bot.message_handler(commands=["audit"])
+def cmd_audit(m):
+    if not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Только владелец")
+    rows = query("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Журнал пуст")
+    text = "📜 АУДИТ\n\n" + "\n".join(
+        f"{r['created'][:16]} | u{r['user_id']} | {r['action']} | {r['details'][:40]}" for r in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["cc", "commandcenter"])
+def cmd_cc(m):
+    users = query("SELECT COUNT(*) AS n FROM users", fetch=True)[0]["n"]
+    members = query("SELECT COUNT(*) AS n FROM department_members", fetch=True)[0]["n"]
+    tasks_open = query("SELECT COUNT(*) AS n FROM tasks WHERE status NOT IN ('done','rejected')", fetch=True)[0]["n"]
+    tasks_done = query("SELECT COUNT(*) AS n FROM tasks WHERE status='done'", fetch=True)[0]["n"]
+    tickets = query("SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('open','in_progress','reopened')", fetch=True)[0]["n"]
+    reports_p = query("SELECT COUNT(*) AS n FROM reports WHERE status='pending'", fetch=True)[0]["n"]
+    kb = query("SELECT COUNT(*) AS n FROM knowledge_base", fetch=True)[0]["n"]
+    text = f"""
+🎛 JARVIS COMMAND CENTER
+
+👥 Пользователи: {users}
+🏢 Сотрудники: {members}
+📋 Задачи: {tasks_open} откр. / {tasks_done} готово
+🎫 Тикеты открыты: {tickets}
+📝 Отчёты на проверке: {reports_p}
+📚 Статей в БЗ: {kb}
+
+Быстрые команды:
+/department — отделы
+/mytasks — мои задачи
+/tickets_all — тикеты (support)
+/reports — отчёты
+/kb — база знаний
+/rating — рейтинг
+/adminstats — админ (владелец)
+"""
+    bot.send_message(m.chat.id, text.strip())
+
+@bot.message_handler(commands=["doc_create"])
+def cmd_doc_create(m):
+    content = m.text.partition(" ")[2]
+    if "|" not in content:
+        return bot.reply_to(m, "/doc_create тип | заголовок | текст\nТипы: statement, memo, complaint, report")
+    parts = [p.strip() for p in content.split("|")]
+    if len(parts) < 3:
+        return bot.reply_to(m, "тип | заголовок | текст")
+    dtype, title, body = parts[0].lower(), parts[1], parts[2]
+    if dtype not in ("statement", "memo", "complaint", "report"):
+        return bot.reply_to(m, "Тип: statement memo complaint report")
+    did = query("INSERT INTO documents(doc_type,title,body,author_id,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+                (dtype, title[:200], body[:4000], m.from_user.id, "pending", datetime.now().isoformat(), datetime.now().isoformat()))
+    audit(m.from_user.id, "doc_create", f"#{did} {dtype}")
+    # notify admin leaders
+    for L in query("SELECT user_id FROM department_members WHERE department='admin' AND role IN ('leader','deputy')", fetch=True):
+        notify(L["user_id"], "📄 Документ", f"#{did} {dtype}: {title[:60]}")
+    bot.reply_to(m, f"✅ Документ #{did} создан")
+
+@bot.message_handler(commands=["docs"])
+def cmd_docs(m):
+    rows = query("SELECT * FROM documents ORDER BY id DESC LIMIT 15", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Документов нет")
+    text = "📄 ДОКУМЕНТЫ\n\n" + "\n".join(
+        f"#{d['id']} [{d['status']}] {d['doc_type']}: {d['title'][:40]}" for d in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["doc_view"])
+def cmd_doc_view(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/doc_view ID")
+    rows = query("SELECT * FROM documents WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    d = rows[0]
+    bot.send_message(m.chat.id, f"📄 #{d['id']} [{d['doc_type']}] {d['status']}\n{d['title']}\n\n{d['body'][:3000]}")
+
+@bot.message_handler(commands=["doc_approve"])
+def cmd_doc_approve(m):
+    if not is_leader_or_deputy(m.from_user.id, "admin") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Только администрация")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/doc_approve ID")
+    did = int(parts[1])
+    rows = query("SELECT * FROM documents WHERE id=?", (did,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    query("UPDATE documents SET status='approved',reviewer_id=?,updated=? WHERE id=?",
+          (m.from_user.id, datetime.now().isoformat(), did))
+    notify(rows[0]["author_id"], "📄", f"Документ #{did} утверждён")
+    audit(m.from_user.id, "doc_approve", str(did))
+    bot.reply_to(m, f"✅ #{did}")
+
+@bot.message_handler(commands=["doc_reject"])
+def cmd_doc_reject(m):
+    if not is_leader_or_deputy(m.from_user.id, "admin") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/doc_reject ID [причина]")
+    did = int(parts[1])
+    reason = parts[2] if len(parts) > 2 else ""
+    rows = query("SELECT * FROM documents WHERE id=?", (did,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    query("UPDATE documents SET status='rejected',reviewer_id=?,updated=? WHERE id=?",
+          (m.from_user.id, datetime.now().isoformat(), did))
+    notify(rows[0]["author_id"], "📄 Отклонён", f"#{did} {reason[:200]}")
+    audit(m.from_user.id, "doc_reject", str(did))
+    bot.reply_to(m, f"❌ #{did}")
+
+
+
+# ===== POINTS / PROMO / INTERVIEW / CABINET / TEMPLATES / TRANSFER =====
+
+@bot.message_handler(commands=["points", "mypoints"])
+def cmd_points(m):
+    rows = query("SELECT department,points FROM department_points WHERE user_id=? ORDER BY points DESC", (m.from_user.id,), True)
+    if not rows:
+        return bot.reply_to(m, "Пока 0 баллов по отделам.\nБаллы даются за задачи, отчёты, тикеты.")
+    text = "⭐ ВАШИ БАЛЛЫ ПО ОТДЕЛАМ\n\n"
+    for r in rows:
+        role = get_member_role(m.from_user.id, r["department"]) or "—"
+        need = ""
+        if role == "trainee":
+            need = f" (до employee: {PROMO_THRESHOLDS['trainee']})"
+        elif role == "employee":
+            need = f" (кандидат в deputy с {PROMO_THRESHOLDS['employee']})"
+        text += f"• {DEPARTMENTS.get(r['department'], (r['department'],))[0]}: {r['points']}{need}\n  роль: {ROLES.get(role, role)}\n"
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(commands=["cabinet"])
+def cmd_cabinet(m):
+    u = get_user(m.from_user)
+    mems = query("SELECT department,role FROM department_members WHERE user_id=?", (m.from_user.id,), True)
+    depts = "\n".join(f"• {DEPARTMENTS.get(x['department'],(x['department'],))[0]} — {ROLES.get(x['role'],x['role'])}" for x in mems) or "Нет"
+    tasks = query("SELECT COUNT(*) AS n FROM tasks WHERE assignee_id=? AND status NOT IN ('done','rejected')", (m.from_user.id,), True)[0]["n"]
+    pts_rows = query("SELECT SUM(points) AS s FROM department_points WHERE user_id=?", (m.from_user.id,), True)
+    dpts = pts_rows[0]["s"] or 0 if pts_rows else 0
+    rating = query("SELECT points,tasks_done FROM ratings WHERE user_id=?", (m.from_user.id,), True)
+    gpts = rating[0]["points"] if rating else 0
+    done = rating[0]["tasks_done"] if rating else 0
+    unread = query("SELECT COUNT(*) AS n FROM notifications WHERE user_id=? AND is_read=0", (m.from_user.id,), True)[0]["n"]
+    bot.send_message(m.chat.id, f"""
+👤 ЛИЧНЫЙ КАБИНЕТ
+
+{u['first_name']} | ID {u['user_id']}
+
+🏢 Отделы:
+{depts}
+
+📋 Активных задач: {tasks}
+✅ Выполнено задач: {done}
+⭐ Баллы отделов: {dpts}
+🏆 Глобальный рейтинг: {gpts}
+🔔 Непрочитанных: {unread}
+
+/mytasks /myreports /points /achievements /notifications /kb
+""")
+
+@bot.message_handler(commands=["transfer"])
+def cmd_transfer(m):
+    if not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Только владелец")
+    parts = m.text.split()
+    if len(parts) < 4:
+        return bot.reply_to(m, "/transfer USER_ID from_dept to_dept [role]")
+    try:
+        uid = int(parts[1])
+    except ValueError:
+        return bot.reply_to(m, "USER_ID число")
+    fr, to = parts[2].lower(), parts[3].lower()
+    role = parts[4].lower() if len(parts) > 4 else "employee"
+    if fr not in DEPARTMENTS or to not in DEPARTMENTS:
+        return bot.reply_to(m, "Неверный отдел")
+    if role not in ROLES:
+        return bot.reply_to(m, "Роль?")
+    remove_member(uid, fr, m.from_user.id, f"transfer to {to}")
+    add_member(uid, to, role, m.from_user.id, f"transfer from {fr}")
+    audit(m.from_user.id, "transfer", f"{uid} {fr}→{to} as {role}")
+    bot.reply_to(m, f"✅ {uid}: {fr} → {to} ({ROLES.get(role,role)})")
+
+@bot.message_handler(commands=["interview_start"])
+def cmd_interview_start(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Только HR")
+    parts = m.text.split()
+    if len(parts) < 3:
+        return bot.reply_to(m, "/interview_start USER_ID dept")
+    try:
+        cid = int(parts[1])
+    except ValueError:
+        return bot.reply_to(m, "USER_ID число")
+    dept = parts[2].lower()
+    if dept not in DEPARTMENTS:
+        return bot.reply_to(m, "Отдел?")
+    iid = query("INSERT INTO interviews(candidate_id,hr_id,department,status,created,updated) VALUES(?,?,?,?,?,?)",
+                (cid, m.from_user.id, dept, "open", datetime.now().isoformat(), datetime.now().isoformat()))
+    for q in DEFAULT_INTERVIEW_QUESTIONS:
+        query("INSERT INTO interview_answers(interview_id,question,answer,created) VALUES(?,?,?,?)",
+              (iid, q, "", datetime.now().isoformat()))
+    notify(cid, "🎤 Собеседование", f"Начато собеседование #{iid} в отдел {DEPARTMENTS[dept][0]}. Отвечайте: /interview_answer {iid} текст")
+    audit(m.from_user.id, "interview_start", f"#{iid} candidate {cid}")
+    bot.reply_to(m, f"✅ Собеседование #{iid}\nКандидат отвечает: /interview_answer {iid} текст\nВопросы:\n" + "\n".join(f"• {q}" for q in DEFAULT_INTERVIEW_QUESTIONS))
+
+@bot.message_handler(commands=["interview_answer"])
+def cmd_interview_answer(m):
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/interview_answer ID текст_ответа")
+    iid, ans = int(parts[1]), parts[2]
+    rows = query("SELECT * FROM interviews WHERE id=?", (iid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдено")
+    inv = rows[0]
+    if inv["candidate_id"] != m.from_user.id and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Только кандидат")
+    # fill first empty answer
+    empty = query("SELECT id,question FROM interview_answers WHERE interview_id=? AND (answer IS NULL OR answer='') ORDER BY id LIMIT 1", (iid,), True)
+    if not empty:
+        return bot.reply_to(m, "Все вопросы уже отвечены")
+    query("UPDATE interview_answers SET answer=? WHERE id=?", (ans[:2000], empty[0]["id"]))
+    notify(inv["hr_id"], "🎤 Ответ", f"Собеседование #{iid}: {empty[0]['question'][:40]} → {ans[:80]}")
+    left = query("SELECT COUNT(*) AS n FROM interview_answers WHERE interview_id=? AND (answer IS NULL OR answer='')", (iid,), True)[0]["n"]
+    bot.reply_to(m, f"✅ Ответ записан. Осталось вопросов: {left}")
+
+@bot.message_handler(commands=["interview_view"])
+def cmd_interview_view(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/interview_view ID")
+    iid = int(parts[1])
+    rows = query("SELECT * FROM interviews WHERE id=?", (iid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдено")
+    inv = rows[0]
+    answers = query("SELECT * FROM interview_answers WHERE interview_id=? ORDER BY id", (iid,), True)
+    text = f"🎤 Собеседование #{iid}\nКандидат: {format_user(inv['candidate_id'])}\nОтдел: {inv['department']}\nСтатус: {inv['status']}\nОценка: {inv['score']}\n\n"
+    for a in answers:
+        text += f"❓ {a['question']}\n➡️ {a['answer'] or '—'}\n\n"
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["interview_score"])
+def cmd_interview_score(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/interview_score ID оценка_1_10 [заметки]")
+    iid = int(parts[1])
+    try:
+        score = int(parts[2].split()[0])
+    except ValueError:
+        return bot.reply_to(m, "Оценка число 1-10")
+    notes = parts[2].partition(" ")[2] if " " in parts[2] else ""
+    rows = query("SELECT * FROM interviews WHERE id=?", (iid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдено")
+    query("UPDATE interviews SET score=?,notes=?,status='scored',updated=? WHERE id=?",
+          (score, notes[:500], datetime.now().isoformat(), iid))
+    notify(rows[0]["candidate_id"], "🎤 Оценка собеседования", f"#{iid}: {score}/10")
+    bot.reply_to(m, f"✅ Оценка {score}/10 сохранена")
+
+@bot.message_handler(commands=["interview_hire"])
+def cmd_interview_hire(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/interview_hire ID [role=trainee]")
+    iid = int(parts[1])
+    role = parts[2].lower() if len(parts) > 2 else "trainee"
+    if role not in ROLES:
+        role = "trainee"
+    rows = query("SELECT * FROM interviews WHERE id=?", (iid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найдено")
+    inv = rows[0]
+    add_member(inv["candidate_id"], inv["department"], role, m.from_user.id, f"interview #{iid}")
+    query("UPDATE interviews SET status='hired',updated=? WHERE id=?", (datetime.now().isoformat(), iid))
+    notify(inv["candidate_id"], "✅ Принят", f"Вы приняты в {DEPARTMENTS.get(inv['department'],(inv['department'],))[0]} как {ROLES.get(role,role)}")
+    audit(m.from_user.id, "interview_hire", f"#{iid}")
+    bot.reply_to(m, f"✅ Кандидат принят как {ROLES.get(role,role)}")
+
+@bot.message_handler(commands=["templates"])
+def cmd_templates(m):
+    if not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    rows = query("SELECT id,title FROM support_templates ORDER BY id DESC LIMIT 20", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Шаблонов нет.\n/template_add название | текст")
+    text = "📋 Шаблоны\n" + "\n".join(f"#{r['id']} {r['title']}" for r in rows)
+    text += "\n\n/template_use ID ticket_id"
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(commands=["template_add"])
+def cmd_template_add(m):
+    if not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    c = m.text.partition(" ")[2]
+    if "|" not in c:
+        return bot.reply_to(m, "/template_add название | текст")
+    title, body = c.split("|", 1)
+    tid = query("INSERT INTO support_templates(title,body,author_id,created) VALUES(?,?,?,?)",
+                (title.strip()[:100], body.strip()[:2000], m.from_user.id, datetime.now().isoformat()))
+    bot.reply_to(m, f"✅ Шаблон #{tid}")
+
+@bot.message_handler(commands=["template_use"])
+def cmd_template_use(m):
+    if not is_in_department(m.from_user.id, "support") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        return bot.reply_to(m, "/template_use TEMPLATE_ID TICKET_ID")
+    tpl_id, ticket_id = int(parts[1]), int(parts[2])
+    tpls = query("SELECT * FROM support_templates WHERE id=?", (tpl_id,), True)
+    tickets = query("SELECT * FROM support_tickets WHERE id=?", (ticket_id,), True)
+    if not tpls or not tickets:
+        return bot.reply_to(m, "Не найдено")
+    body = tpls[0]["body"]
+    # reuse ticket reply logic
+    update_ticket(ticket_id, m.from_user.id, "reply", body, new_status="answered")
+    notify(tickets[0]["user_id"], f"🎫 Ответ #{ticket_id}", body[:500])
+    try:
+        bot.send_message(tickets[0]["user_id"], f"🎫 Ответ #{ticket_id}:\n{body}")
+    except Exception:
+        pass
+    bot.reply_to(m, f"✅ Шаблон отправлен в тикет #{ticket_id}")
+
+@bot.message_handler(commands=["rate_ticket"])
+def cmd_rate_ticket(m):
+    parts = m.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/rate_ticket ID оценка_1_5 [комментарий]")
+    tid = int(parts[1])
+    try:
+        score = int(parts[2].split()[0])
+    except ValueError:
+        return bot.reply_to(m, "Оценка 1-5")
+    if score < 1 or score > 5:
+        return bot.reply_to(m, "Оценка 1-5")
+    comment = parts[2].partition(" ")[2] if " " in parts[2] else ""
+    rows = query("SELECT * FROM support_tickets WHERE id=?", (tid,), True)
+    if not rows:
+        return bot.reply_to(m, "Тикет не найден")
+    t = rows[0]
+    if t["user_id"] != m.from_user.id:
+        return bot.reply_to(m, "Можно оценить только свой тикет")
+    if t["status"] != "closed":
+        return bot.reply_to(m, "Тикет ещё не закрыт")
+    exists = query("SELECT id FROM ticket_ratings WHERE ticket_id=? AND user_id=?", (tid, m.from_user.id), True)
+    if exists:
+        return bot.reply_to(m, "Уже оценён")
+    query("INSERT INTO ticket_ratings(ticket_id,user_id,score,comment,created) VALUES(?,?,?,?,?)",
+          (tid, m.from_user.id, score, comment[:300], datetime.now().isoformat()))
+    if t["assignee_id"]:
+        add_dept_points(t["assignee_id"], "support", score * 2, f"Оценка тикета #{tid}: {score}/5")
+        notify(t["assignee_id"], "⭐ Оценка тикета", f"#{tid}: {score}/5")
+    bot.reply_to(m, "Спасибо за оценку!")
+
+@bot.message_handler(commands=["remind"])
+def cmd_remind(m):
+    text = m.text.partition(" ")[2].strip()
+    if "|" not in text:
+        return bot.reply_to(m, "Использование: /remind YYYY-MM-DD HH:MM | текст")
+    when, body = text.split("|", 1)
+    when, body = when.strip(), body.strip()
+    rid = query("INSERT INTO reminders(user_id,text,due_at,created) VALUES(?,?,?,?)",
+                (m.from_user.id, body[:500], when, datetime.now().isoformat()))
+    bot.reply_to(m, f"Напоминание #{rid} на {when}")
+
+@bot.message_handler(commands=["promos"])
+def cmd_promos(m):
+    text = "⬆️ ПОРОГИ АВТО-ПОВЫШЕНИЯ\n\n"
+    text += f"Стажёр → Сотрудник: {PROMO_THRESHOLDS.get('trainee',50)} баллов отдела\n"
+    text += f"Сотрудник → кандидат в Замы: {PROMO_THRESHOLDS.get('employee',150)} баллов\n\n"
+    text += "Баллы начисляются за задачи, отчёты, закрытые тикеты и оценки.\n/points — ваши баллы"
+    bot.send_message(m.chat.id, text)
+
+
+
+# ===== PROJECTS / OVERDUE / DIGEST / PROBATION / WARNINGS =====
+
+@bot.message_handler(commands=["project_create"])
+def cmd_project_create(m):
+    text = m.text.partition(" ")[2].strip()
+    if "|" not in text:
+        return bot.reply_to(m, "/project_create dept | название | описание")
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) < 3:
+        return bot.reply_to(m, "dept | название | описание")
+    dept, title, desc = parts[0].lower(), parts[1], parts[2]
+    if dept not in DEPARTMENTS:
+        return bot.reply_to(m, "Отдел?")
+    if not is_leader_or_deputy(m.from_user.id, dept) and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    pid = query("INSERT INTO projects(department,title,description,status,owner_id,created,updated) VALUES(?,?,?,?,?,?,?)",
+                (dept, title[:200], desc[:2000], "active", m.from_user.id, datetime.now().isoformat(), datetime.now().isoformat()))
+    query("INSERT OR IGNORE INTO project_members(project_id,user_id) VALUES(?,?)", (pid, m.from_user.id))
+    audit(m.from_user.id, "project_create", f"#{pid}")
+    bot.reply_to(m, f"✅ Проект #{pid}")
+
+@bot.message_handler(commands=["projects"])
+def cmd_projects(m):
+    parts = m.text.split()
+    dept = parts[1].lower() if len(parts) > 1 else None
+    if dept and dept not in DEPARTMENTS:
+        return bot.reply_to(m, "Отдел?")
+    if dept:
+        rows = query("SELECT * FROM projects WHERE department=? ORDER BY id DESC LIMIT 20", (dept,), True)
+    else:
+        rows = query("SELECT * FROM projects WHERE status='active' ORDER BY id DESC LIMIT 20", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Проектов нет")
+    text = "📁 ПРОЕКТЫ\n\n" + "\n".join(
+        f"#{p['id']} [{p['status']}] {p['title'][:40]} ({p['department']})" for p in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["project_view"])
+def cmd_project_view(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/project_view ID")
+    rows = query("SELECT * FROM projects WHERE id=?", (int(parts[1]),), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    p = rows[0]
+    mems = query("SELECT user_id FROM project_members WHERE project_id=?", (p["id"],), True)
+    bot.send_message(m.chat.id, f"📁 #{p['id']} {p['title']}\n{p['description']}\nОтдел: {p['department']}\nСтатус: {p['status']}\nУчастников: {len(mems)}")
+
+@bot.message_handler(commands=["project_join"])
+def cmd_project_join(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/project_join ID")
+    pid = int(parts[1])
+    rows = query("SELECT * FROM projects WHERE id=?", (pid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    if not is_in_department(m.from_user.id, rows[0]["department"]) and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "Нужно быть в отделе проекта")
+    query("INSERT OR IGNORE INTO project_members(project_id,user_id) VALUES(?,?)", (pid, m.from_user.id))
+    bot.reply_to(m, f"✅ Вы в проекте #{pid}")
+
+@bot.message_handler(commands=["project_done"])
+def cmd_project_done(m):
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/project_done ID")
+    pid = int(parts[1])
+    rows = query("SELECT * FROM projects WHERE id=?", (pid,), True)
+    if not rows:
+        return bot.reply_to(m, "Не найден")
+    p = rows[0]
+    if not is_leader_or_deputy(m.from_user.id, p["department"]) and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    query("UPDATE projects SET status='done',updated=? WHERE id=?", (datetime.now().isoformat(), pid))
+    bot.reply_to(m, f"✅ Проект #{pid} завершён")
+
+@bot.message_handler(commands=["overdue"])
+def cmd_overdue(m):
+    today = datetime.now().strftime("%Y-%m-%d")
+    rows = query("""SELECT * FROM tasks WHERE status NOT IN ('done','rejected')
+                    AND deadline IS NOT NULL AND deadline != '' AND deadline < ?
+                    ORDER BY deadline LIMIT 25""", (today,), True)
+    if not rows:
+        return bot.reply_to(m, "Просроченных задач нет 👍")
+    text = "⏰ ПРОСРОЧЕНО\n\n"
+    for t in rows:
+        text += f"#{t['id']} [{t['department']}] {t['title'][:40]}\n  срок: {t['deadline']} | {format_user(t['assignee_id'])}\n"
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["digest"])
+def cmd_digest(m):
+    if not is_owner(m.from_user.id):
+        # allow any leader
+        is_L = query("SELECT 1 FROM department_members WHERE user_id=? AND role IN ('leader','deputy','deputy_owner')", (m.from_user.id,), True)
+        if not is_L:
+            return bot.reply_to(m, "⛔ Руководители/владелец")
+    users = query("SELECT COUNT(*) AS n FROM users", fetch=True)[0]["n"]
+    open_tasks = query("SELECT COUNT(*) AS n FROM tasks WHERE status NOT IN ('done','rejected')", fetch=True)[0]["n"]
+    done_week = query("SELECT COUNT(*) AS n FROM tasks WHERE status='done' AND closed_at >= date('now','-7 days')", fetch=True)[0]["n"]
+    tickets_open = query("SELECT COUNT(*) AS n FROM support_tickets WHERE status IN ('open','in_progress','reopened')", fetch=True)[0]["n"]
+    pending_rep = query("SELECT COUNT(*) AS n FROM reports WHERE status='pending'", fetch=True)[0]["n"]
+    today = datetime.now().strftime("%Y-%m-%d")
+    overdue = query("SELECT COUNT(*) AS n FROM tasks WHERE status NOT IN ('done','rejected') AND deadline IS NOT NULL AND deadline != '' AND deadline < ?", (today,), True)[0]["n"]
+    top = query("""SELECT u.first_name,r.points FROM ratings r JOIN users u ON u.user_id=r.user_id
+                   ORDER BY r.points DESC LIMIT 5""", fetch=True)
+    top_txt = "\n".join(f"  {i}. {t['first_name']} — {t['points']}" for i,t in enumerate(top,1)) or "  —"
+    bot.send_message(m.chat.id, f"""
+📊 ДАЙДЖЕСТ JARVIS
+
+👥 Пользователи: {users}
+📋 Открытых задач: {open_tasks}
+✅ Сделано за 7 дней: {done_week}
+⏰ Просрочено: {overdue}
+🎫 Тикеты открыты: {tickets_open}
+📝 Отчёты на проверке: {pending_rep}
+
+🏆 Топ рейтинга:
+{top_txt}
+
+/cc /overdue /rating /adminstats
+""".strip())
+
+@bot.message_handler(commands=["probation"])
+def cmd_probation(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        # own probation
+        rows = query("SELECT * FROM probation WHERE user_id=? AND status='active'", (m.from_user.id,), True)
+        if not rows:
+            return bot.reply_to(m, "Нет активного испытательного срока")
+        text = "⏳ Ваш испытательный срок\n\n"
+        for r in rows:
+            text += f"• {DEPARTMENTS.get(r['department'],(r['department'],))[0]}: до {r['ends'][:10]}\n"
+        return bot.send_message(m.chat.id, text)
+    # HR view all
+    rows = query("SELECT * FROM probation WHERE status='active' ORDER BY ends LIMIT 30", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Активных испытательных нет")
+    text = "⏳ ИСПЫТАТЕЛЬНЫЕ\n\n" + "\n".join(
+        f"u{r['user_id']} | {r['department']} | до {r['ends'][:10]}" for r in rows)
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["probation_end"])
+def cmd_probation_end(m):
+    if not is_in_department(m.from_user.id, "hr") and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 3 or not parts[1].isdigit():
+        return bot.reply_to(m, "/probation_end USER_ID dept [pass|fail]")
+    uid = int(parts[1])
+    dept = parts[2].lower()
+    result = parts[3].lower() if len(parts) > 3 else "pass"
+    if dept not in DEPARTMENTS:
+        return bot.reply_to(m, "Отдел?")
+    query("UPDATE probation SET status=? WHERE user_id=? AND department=?",
+          ("passed" if result == "pass" else "failed", uid, dept))
+    if result == "pass":
+        role = get_member_role(uid, dept)
+        if role == "trainee":
+            add_member(uid, dept, "employee", m.from_user.id, "probation passed")
+        notify(uid, "✅ Испытательный пройден", DEPARTMENTS[dept][0])
+    else:
+        remove_member(uid, dept, m.from_user.id, "probation failed")
+        notify(uid, "❌ Испытательный не пройден", DEPARTMENTS[dept][0])
+    audit(m.from_user.id, "probation_end", f"{uid} {dept} {result}")
+    bot.reply_to(m, f"✅ Испытательный {uid} / {dept}: {result}")
+
+@bot.message_handler(commands=["warnings"])
+def cmd_warnings(m):
+    parts = m.text.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        if not is_owner(m.from_user.id) and not any(
+            is_leader_or_deputy(m.from_user.id, d) for d in DEPARTMENTS
+        ):
+            return bot.reply_to(m, "⛔")
+        uid = int(parts[1])
+        rows = query("SELECT * FROM warnings WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,), True)
+    else:
+        uid = m.from_user.id
+        rows = query("SELECT * FROM warnings WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,), True)
+    if not rows:
+        return bot.reply_to(m, "Предупреждений нет")
+    text = f"⚠️ Предупреждения u{uid}\n\n" + "\n".join(
+        f"#{r['id']} [{r['department']}] {r['reason'][:60]} ({r['created'][:10]})" for r in rows)
+    text += f"\n\nВсего: {len(rows)} (лимит {WARN_LIMIT})"
+    bot.send_message(m.chat.id, text[:4000])
+
+@bot.message_handler(commands=["myreminders"])
+def cmd_myreminders(m):
+    rows = query("SELECT * FROM reminders WHERE user_id=? AND sent=0 ORDER BY due_at LIMIT 15", (m.from_user.id,), True)
+    if not rows:
+        return bot.reply_to(m, "Нет активных напоминаний")
+    text = "⏰\n" + "\n".join(f"#{r['id']} {r['due_at']}: {r['text'][:50]}" for r in rows)
+    bot.send_message(m.chat.id, text)
+
+
+
+# ===== SHOP / STARS / ADS / LIMITS / IMAGE / VOICE =====
+
+@bot.message_handler(commands=["limits", "quota"])
+def cmd_limits(m):
+    u = get_user(m.from_user)
+    text = "📊 ЛИМИТЫ НА СЕГОДНЯ\n\n"
+    for model, lim in MODEL_DAILY_LIMITS.items():
+        used = get_model_usage(m.from_user.id, model)
+        short = model.split("/")[-1]
+        text += f"• {short}: {used}/{lim}\n"
+    extra = get_extra_quota(m.from_user.id)
+    text += f"\n💎 Платный запас: {extra} запросов\n/shop — купить пакет\n/model — выбрать модель"
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(commands=["shop"])
+def cmd_shop(m):
+    text = "🛒 МАГАЗИН JARVIS\n\n"
+    for code, p in SHOP_PRODUCTS.items():
+        text += f"• {p['title']} — {p['price_stars']} ⭐\n  код: `{code}`\n"
+    text += "\nКупить за Stars: /buy код\n"
+    if TON_WALLET:
+        text += f"TON: перевод на `{TON_WALLET}` + /ton_order код (ручная проверка владельцем)\n"
+    text += "\n/limits — ваши лимиты"
+    bot.send_message(m.chat.id, text)
+
+@bot.message_handler(commands=["buy"])
+def cmd_buy(m):
+    code = m.text.partition(" ")[2].strip().lower()
+    if code not in SHOP_PRODUCTS:
+        return bot.reply_to(m, "Товар не найден. /shop")
+    product = SHOP_PRODUCTS[code]
+    payload = f"jarvis:{code}:{m.from_user.id}:{int(time.time())}"
+    oid = query("INSERT INTO shop_orders(user_id,product,amount_stars,status,payload,created) VALUES(?,?,?,?,?,?)",
+                (m.from_user.id, code, product["price_stars"], "pending", payload, datetime.now().isoformat()))
+    try:
+        from telebot.types import LabeledPrice
+        prices = [LabeledPrice(label=product["title"][:32], amount=product["price_stars"])]
+        bot.send_invoice(
+            m.chat.id,
+            title=product["title"][:32],
+            description=f"JARVIS: {product['title']}",
+            invoice_payload=payload,
+            provider_token="",  # empty for Telegram Stars
+            currency="XTR",
+            prices=prices,
+            start_parameter=f"buy_{oid}"
+        )
+        bot.reply_to(m, f"Заказ #{oid}. Оплатите Stars в счёте выше.")
+    except Exception as e:
+        bot.reply_to(m, f"Не удалось выставить счёт Stars: {e}\nОбратитесь к владельцу или используйте TON.")
+
+@bot.pre_checkout_query_handler(func=lambda q: True)
+def pre_checkout(q):
+    try:
+        bot.answer_pre_checkout_query(q.id, ok=True)
+    except Exception as e:
+        print("[PAY]", e)
+
+@bot.message_handler(content_types=["successful_payment"])
+def on_successful_payment(m):
+    sp = m.successful_payment
+    payload = sp.invoice_payload or ""
+    # payload: jarvis:code:uid:ts
+    parts = payload.split(":")
+    code = parts[1] if len(parts) >= 2 else ""
+    product = SHOP_PRODUCTS.get(code)
+    query("UPDATE shop_orders SET status='paid',paid_at=? WHERE payload=?",
+          (datetime.now().isoformat(), payload))
+    if not product:
+        return bot.send_message(m.chat.id, "Оплата получена, но товар не распознан. Напишите владельцу.")
+    if "requests" in product:
+        add_extra_quota(m.from_user.id, product["requests"])
+        bot.send_message(m.chat.id, f"✅ Оплачено! +{product['requests']} запросов. /limits")
+        audit(m.from_user.id, "shop_paid", code)
+    elif "ad_hours" in product:
+        bot.send_message(m.chat.id, f"✅ Оплачена реклама на {product['ad_hours']} ч.\nОтправьте текст:\n/ad_run {product['ad_hours']}h | ваш текст рекламы")
+        audit(m.from_user.id, "shop_ad_paid", code)
+    else:
+        bot.send_message(m.chat.id, "✅ Оплата получена.")
+
+@bot.message_handler(commands=["ton_order"])
+def cmd_ton_order(m):
+    code = m.text.partition(" ")[2].strip().lower()
+    if code not in SHOP_PRODUCTS:
+        return bot.reply_to(m, "/ton_order код_товара")
+    if not TON_WALLET:
+        return bot.reply_to(m, "TON не настроен (TON_WALLET)")
+    product = SHOP_PRODUCTS[code]
+    oid = query("INSERT INTO shop_orders(user_id,product,amount_stars,status,payload,created) VALUES(?,?,?,?,?,?)",
+                (m.from_user.id, code, 0, "ton_pending", f"ton:{code}:{m.from_user.id}", datetime.now().isoformat()))
+    bot.reply_to(m, f"Заказ #{oid}\nПереведите TON на:\n`{TON_WALLET}`\n\nПосле оплаты владелец подтвердит: /ton_confirm {oid}")
+
+@bot.message_handler(commands=["ton_confirm"])
+def cmd_ton_confirm(m):
+    if not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔")
+    parts = m.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return bot.reply_to(m, "/ton_confirm ORDER_ID")
+    oid = int(parts[1])
+    rows = query("SELECT * FROM shop_orders WHERE id=?", (oid,), True)
+    if not rows:
+        return bot.reply_to(m, "Нет")
+    o = rows[0]
+    product = SHOP_PRODUCTS.get(o["product"])
+    query("UPDATE shop_orders SET status='paid',paid_at=? WHERE id=?", (datetime.now().isoformat(), oid))
+    if product and "requests" in product:
+        add_extra_quota(o["user_id"], product["requests"])
+        notify(o["user_id"], "✅ TON оплата", f"+{product['requests']} запросов")
+    elif product and "ad_hours" in product:
+        notify(o["user_id"], "✅ TON реклама", f"/ad_run {product['ad_hours']}h | текст")
+    bot.reply_to(m, f"✅ Заказ #{oid} подтверждён")
+
+@bot.message_handler(commands=["ad_run"])
+def cmd_ad_run(m):
+    text = m.text.partition(" ")[2].strip()
+    # format: 1h | ad text   or just check paid ad
+    if "|" not in text:
+        return bot.reply_to(m, "/ad_run 1h | текст рекламы\n(нужна оплаченная реклама /shop)")
+    head, body = text.split("|", 1)
+    head, body = head.strip().lower(), body.strip()
+    hours = 1
+    if head.endswith("h") and head[:-1].isdigit():
+        hours = int(head[:-1])
+    # verify user has recent paid ad order matching hours or any ad
+    paid = query("""SELECT * FROM shop_orders WHERE user_id=? AND status='paid' AND product LIKE 'ad_%'
+                    ORDER BY id DESC LIMIT 5""", (m.from_user.id,), True)
+    ok = False
+    for o in paid:
+        p = SHOP_PRODUCTS.get(o["product"], {})
+        if p.get("ad_hours") == hours or True:
+            # mark consumed by setting status used
+            query("UPDATE shop_orders SET status='used' WHERE id=?", (o["id"],))
+            ok = True
+            break
+    if not ok and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "Нет оплаченной рекламы. /shop")
+    from datetime import timedelta
+    start = datetime.now()
+    end = start + timedelta(hours=hours)
+    aid = query("INSERT INTO ads(user_id,text,hours,status,started,ends,message_ids) VALUES(?,?,?,?,?,?,?)",
+                (m.from_user.id, body[:1000], hours, "active", start.isoformat(), end.isoformat(), "[]"))
+    # post to ads channel
+    msg_refs = []
+    if ADS_CHANNEL:
+        try:
+            msg = bot.send_message(ADS_CHANNEL, f"📢 РЕКЛАМА\n\n{body}")
+            msg_refs.append({"chat": ADS_CHANNEL, "mid": msg.message_id})
+        except Exception as e:
+            print("[AD channel]", e)
+    # post to known group chats from chats table where enabled
+    chats = query("SELECT chat_id FROM chats WHERE chat_id < 0 AND enabled=1 LIMIT 30", fetch=True)
+    for c in chats:
+        try:
+            msg = bot.send_message(c["chat_id"], f"📢 РЕКЛАМА\n\n{body}")
+            msg_refs.append({"chat": c["chat_id"], "mid": msg.message_id})
+        except Exception:
+            pass
+    import json
+    query("UPDATE ads SET message_ids=? WHERE id=?", (json.dumps(msg_refs), aid))
+    audit(m.from_user.id, "ad_run", f"#{aid} {hours}h")
+    bot.reply_to(m, f"✅ Реклама #{aid} запущена на {hours} ч. (постов: {len(msg_refs)})\nЗавершение: {end.strftime('%Y-%m-%d %H:%M')}")
+
+@bot.message_handler(commands=["ad_status"])
+def cmd_ad_status(m):
+    rows = query("SELECT * FROM ads WHERE status='active' ORDER BY id DESC LIMIT 10", fetch=True)
+    if not rows:
+        return bot.reply_to(m, "Активных реклам нет")
+    text = "📢 Активная реклама\n\n" + "\n".join(
+        f"#{a['id']} до {a['ends'][:16]} | u{a['user_id']}" for a in rows)
+    bot.send_message(m.chat.id, text)
+
+def cleanup_expired_ads():
+    import json
+    now = datetime.now().isoformat()
+    rows = query("SELECT * FROM ads WHERE status='active' AND ends < ?", (now,), True)
+    for a in rows:
+        try:
+            refs = json.loads(a["message_ids"] or "[]")
+        except Exception:
+            refs = []
+        for r in refs:
+            try:
+                bot.delete_message(r["chat"], r["mid"])
+            except Exception:
+                pass
+        query("UPDATE ads SET status='ended' WHERE id=?", (a["id"],))
+        notify(a["user_id"], "📢 Реклама завершена", f"#{a['id']} удалена из чатов")
+
+@bot.message_handler(commands=["img", "image"])
+def cmd_image(m):
+    prompt = m.text.partition(" ")[2].strip()
+    if not prompt:
+        return bot.reply_to(m, "/img описание картинки")
+    if not IMAGE_API_KEY:
+        return bot.reply_to(m, "Генерация изображений не настроена (IMAGE_API_KEY).\nМожно подключить Flux/OpenAI/Stability.")
+    bot.reply_to(m, "🎨 Генерация пока требует внешний API. Ключ задан — интеграцию можно расширить под ваш провайдер.")
+    # Placeholder: user can wire specific provider; structure ready
+
+@bot.message_handler(commands=["voice_on", "voice_off"])
+def cmd_voice_toggle(m):
+    if m.text.startswith("/voice_on"):
+        query("UPDATE users SET custom_prompt = CASE WHEN custom_prompt LIKE '%[VOICE]%' THEN custom_prompt ELSE custom_prompt || char(10) || '[VOICE]' END WHERE user_id=?",
+              (m.from_user.id,))
+        bot.reply_to(m, "🎙 Голосовые ответы: желаемый режим отмечен. Нужен TTS_ENABLED=1 и сервис озвучки.")
+    else:
+        bot.reply_to(m, "Голосовой режим: выкл (полная TTS-интеграция — отдельный сервис).")
 
 
 # =====================================================
