@@ -13,9 +13,8 @@ import time
 import sqlite3
 import threading
 import requests
-import json
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from telebot import TeleBot, types
 
 # =====================================================
@@ -24,7 +23,7 @@ from telebot import TeleBot, types
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "8675927241"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 
 BOT_NAME = "JARVIS"
 VERSION = "3.0"
@@ -66,7 +65,7 @@ bot_username = None
 bot_id = None
 
 # =====================================================
-# PERSONALITIES (unchanged)
+# PERSONALITIES
 # =====================================================
 
 PERSONALITIES = {
@@ -131,7 +130,6 @@ def query(sql, params=(), fetch=False):
 def init_db():
     with db_lock:
         db.executescript("""
-        -- ===== OLD TABLES (preserved) =====
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             username TEXT DEFAULT '',
@@ -185,7 +183,6 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS history_index ON history(chat_id,user_id,id);
 
-        -- ===== NEW TABLES JARVIS 3.0 =====
         CREATE TABLE IF NOT EXISTS departments (
             code TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -359,7 +356,6 @@ def init_db():
         """)
         db.commit()
 
-        # Seed departments
         for code, (name, desc) in DEPARTMENTS.items():
             query(
                 "INSERT OR IGNORE INTO departments(code,name,description,created) VALUES(?,?,?,?)",
@@ -378,7 +374,6 @@ def get_user(user):
         user.first_name or "",
         datetime.now().isoformat()
     ))
-
     query("""
         UPDATE users SET username=?, first_name=?
         WHERE user_id=?
@@ -387,7 +382,6 @@ def get_user(user):
         user.first_name or "",
         user.id
     ))
-
     return query(
         "SELECT * FROM users WHERE user_id=?",
         (user.id,),
@@ -396,15 +390,8 @@ def get_user(user):
 
 
 def get_chat(chat_id):
-    query(
-        "INSERT OR IGNORE INTO chats(chat_id) VALUES(?)",
-        (chat_id,)
-    )
-    return query(
-        "SELECT * FROM chats WHERE chat_id=?",
-        (chat_id,),
-        True
-    )[0]
+    query("INSERT OR IGNORE INTO chats(chat_id) VALUES(?)", (chat_id,))
+    return query("SELECT * FROM chats WHERE chat_id=?", (chat_id,), True)[0]
 
 
 def save_message(chat_id, user_id, role, message):
@@ -413,13 +400,9 @@ def save_message(chat_id, user_id, role, message):
         (chat_id,user_id,role,message,created)
         VALUES(?,?,?,?,?)
     """, (
-        chat_id,
-        user_id,
-        role,
-        message[:12000],
+        chat_id, user_id, role, message[:12000],
         datetime.now().isoformat()
     ))
-
     query("""
         DELETE FROM history
         WHERE chat_id=? AND user_id=?
@@ -436,9 +419,7 @@ def get_history(chat_id, user_id):
         SELECT role,message FROM history
         WHERE chat_id=? AND user_id=?
         ORDER BY id DESC LIMIT ?
-    """, (
-        chat_id, user_id, MAX_HISTORY
-    ), True)[::-1]
+    """, (chat_id, user_id, MAX_HISTORY), True)[::-1]
 
 
 # =====================================================
@@ -472,25 +453,15 @@ def backup_worker():
 
 
 # =====================================================
-# AI SYSTEM PROMPT (unchanged logic)
+# AI SYSTEM PROMPT
 # =====================================================
 
 def system_prompt(user, chat):
     personality = user["personality"]
     if chat["chat_id"] < 0:
         personality = chat["personality"]
-
-    name, prompt = PERSONALITIES.get(
-        personality,
-        PERSONALITIES["normal"]
-    )
-
-    custom = (
-        chat["custom_prompt"]
-        or user["custom_prompt"]
-        or ""
-    )
-
+    name, prompt = PERSONALITIES.get(personality, PERSONALITIES["normal"])
+    custom = chat["custom_prompt"] or user["custom_prompt"] or ""
     return f"""
 Ты — {BOT_NAME}, персональный искусственный интеллект.
 
@@ -518,7 +489,7 @@ def system_prompt(user, chat):
 
 
 # =====================================================
-# GROQ AI (unchanged)
+# GROQ AI
 # =====================================================
 
 def parse_groq_error(response):
@@ -540,24 +511,16 @@ def parse_groq_error(response):
 
 def ask_groq(chat_id, user, chat, text):
     history = get_history(chat_id, user["user_id"])
-    messages = [{
-        "role": "system",
-        "content": system_prompt(user, chat)
-    }]
+    messages = [{"role": "system", "content": system_prompt(user, chat)}]
     for item in history:
         role = item["role"]
         if role == "model":
             role = "assistant"
         if role not in ("user", "assistant"):
             continue
-        messages.append({
-            "role": role,
-            "content": item["message"]
-        })
-    messages.append({
-        "role": "user",
-        "content": text
-    })
+        messages.append({"role": role, "content": item["message"]})
+    messages.append({"role": "user", "content": text})
+
     payload = {
         "model": MODEL,
         "messages": messages,
@@ -565,6 +528,7 @@ def ask_groq(chat_id, user, chat, text):
         "top_p": 0.95,
         "max_completion_tokens": MAX_OUTPUT
     }
+
     try:
         response = requests.post(
             GROQ_URL,
@@ -602,16 +566,10 @@ def ask_groq(chat_id, user, chat, text):
     if not choices:
         raise RuntimeError("Groq не вернул ответ. " + str(data)[:700])
 
-    answer = (
-        choices[0]
-        .get("message", {})
-        .get("content", "")
-    )
+    answer = choices[0].get("message", {}).get("content", "")
     if isinstance(answer, list):
         answer = "\n".join(
-            item.get("text", "")
-            for item in answer
-            if isinstance(item, dict)
+            item.get("text", "") for item in answer if isinstance(item, dict)
         )
     if not isinstance(answer, str) or not answer.strip():
         raise RuntimeError("Groq вернул пустой ответ.")
@@ -620,10 +578,7 @@ def ask_groq(chat_id, user, chat, text):
     save_message(chat_id, user["user_id"], "user", text)
     save_message(chat_id, user["user_id"], "model", answer)
 
-    query(
-        "UPDATE users SET requests=requests+1 WHERE user_id=?",
-        (user["user_id"],)
-    )
+    query("UPDATE users SET requests=requests+1 WHERE user_id=?", (user["user_id"],))
     query("""
         INSERT INTO activity(user_id,chat_id,requests)
         VALUES(?,?,1)
@@ -721,7 +676,9 @@ def format_user(uid):
     name = u["first_name"] or "—"
     un = f" @{u['username']}" if u["username"] else ""
     return f"{name}{un} ({uid})"
-    # =====================================================
+
+
+# =====================================================
 # KEYBOARDS
 # =====================================================
 
@@ -823,13 +780,6 @@ def task_status_keyboard(task_id, user_id, task):
     return kb
 
 
-def priority_keyboard(prefix):
-    kb = types.InlineKeyboardMarkup(row_width=2)
-    for p, name in PRIORITIES.items():
-        kb.add(types.InlineKeyboardButton(name, callback_data=f"{prefix}_{p}"))
-    return kb
-
-
 # =====================================================
 # DEPARTMENT / MEMBER MANAGEMENT
 # =====================================================
@@ -841,7 +791,6 @@ def add_member(user_id, department, role, by_user, comment=""):
         VALUES(?,?,?,?)
         ON CONFLICT(user_id,department) DO UPDATE SET role=excluded.role
     """, (user_id, department, role, datetime.now().isoformat()))
-
     query("""
         INSERT INTO appointment_history
         (user_id,department,old_role,new_role,by_user,action,comment,created)
@@ -927,30 +876,27 @@ def update_task_status(task_id, new_status, user_id):
     if not task:
         return False
     now = datetime.now().isoformat()
-    extra = ""
     if new_status == "accepted":
-        extra = ", accepted_at=?"
-        params = (new_status, now, now, task_id)
+        query("UPDATE tasks SET status=?, updated=?, accepted_at=? WHERE id=?",
+              (new_status, now, now, task_id))
     elif new_status == "review":
-        extra = ", submitted_at=?"
-        params = (new_status, now, now, task_id)
+        query("UPDATE tasks SET status=?, updated=?, submitted_at=? WHERE id=?",
+              (new_status, now, now, task_id))
     elif new_status in ("done", "rejected"):
-        extra = ", closed_at=?"
-        params = (new_status, now, now, task_id)
+        query("UPDATE tasks SET status=?, updated=?, closed_at=? WHERE id=?",
+              (new_status, now, now, task_id))
         if new_status == "done":
-            add_points(task["assignee_id"], 10 if task["priority"] != "critical" else 25, f"Задача #{task_id}")
+            pts = 25 if task["priority"] == "critical" else 10
+            add_points(task["assignee_id"], pts, f"Задача #{task_id}")
             query("UPDATE ratings SET tasks_done=tasks_done+1 WHERE user_id=?", (task["assignee_id"],))
     else:
-        params = (new_status, now, task_id)
+        query("UPDATE tasks SET status=?, updated=? WHERE id=?", (new_status, now, task_id))
 
-    if extra:
-        query(f"UPDATE tasks SET status=?, updated=?{extra} WHERE id=?", params)
-    else:
-        query("UPDATE tasks SET status=?, updated=? WHERE id=?", params)
-
-    notify(task["assignee_id"], "📋 Статус задачи", f"#{task_id} → {TASK_STATUSES.get(new_status, new_status)}")
+    notify(task["assignee_id"], "📋 Статус задачи",
+           f"#{task_id} → {TASK_STATUSES.get(new_status, new_status)}")
     if task["creator_id"] != user_id:
-        notify(task["creator_id"], "📋 Статус задачи", f"#{task_id} → {TASK_STATUSES.get(new_status, new_status)}")
+        notify(task["creator_id"], "📋 Статус задачи",
+               f"#{task_id} → {TASK_STATUSES.get(new_status, new_status)}")
     return True
 
 
@@ -1001,7 +947,6 @@ def create_report(user_id, department, report_type, period, content):
         user_id, department, report_type, period, content[:4000],
         "pending", datetime.now().isoformat()
     ))
-    # notify leaders
     leaders = query(
         "SELECT user_id FROM department_members WHERE department=? AND role IN ('leader','deputy')",
         (department,), True
@@ -1041,7 +986,6 @@ def create_ticket(user_id, category, subject, description):
         "INSERT INTO ticket_history(ticket_id,user_id,action,comment,created) VALUES(?,?,?,?,?)",
         (tid, user_id, "created", "", datetime.now().isoformat())
     )
-    # notify support members
     members = query(
         "SELECT user_id FROM department_members WHERE department='support'",
         fetch=True
@@ -1054,13 +998,12 @@ def create_ticket(user_id, category, subject, description):
 def update_ticket(ticket_id, user_id, action, comment="", assignee_id=None, new_status=None):
     now = datetime.now().isoformat()
     if new_status:
-        extra = ""
-        params = [new_status, now]
         if new_status == "closed":
-            extra = ", closed_at=?"
-            params.append(now)
-        params.append(ticket_id)
-        query(f"UPDATE support_tickets SET status=?, updated=?{extra} WHERE id=?", params)
+            query("UPDATE support_tickets SET status=?, updated=?, closed_at=? WHERE id=?",
+                  (new_status, now, now, ticket_id))
+        else:
+            query("UPDATE support_tickets SET status=?, updated=? WHERE id=?",
+                  (new_status, now, ticket_id))
     if assignee_id is not None:
         query("UPDATE support_tickets SET assignee_id=?, updated=? WHERE id=?",
               (assignee_id, now, ticket_id))
@@ -1123,8 +1066,10 @@ def close_check(check_id, result, status="closed"):
     query("""
         UPDATE control_checks SET result=?, status=?, closed_at=? WHERE id=?
     """, (result[:1000], status, datetime.now().isoformat(), check_id))
-    # =====================================================
-# COMMANDS — OLD + NEW
+
+
+# =====================================================
+# COMMANDS
 # =====================================================
 
 @bot.message_handler(commands=["start"])
@@ -1173,47 +1118,67 @@ def cmd_help(m):
 /ai текст — спросить ИИ
 /personality — характер
 /memory — память
-/remember текст — сохранить
+/remember текст — сохранить в память
 /forget — очистить память
-/teach фраза | ответ — обучение
+/teach фраза | ответ — обучить бота
 /learning — список обучения
-/clearlearning — очистить обучение
-/reset — сброс истории
-/profile — профиль
+/reset — сброс истории диалога
+/profile — мой профиль
 /stats — статистика
-/top — рейтинг активности
+/top — топ активности
 /settings — настройки
-/auto_on /auto_off
-/bot_on /bot_off
-/myid /chatid /ping
+/myid — мой Telegram ID
+/chatid — ID чата
+/ping — проверка работы
 
 Отделы и работа:
 /department — список отделов
 /mytasks — мои задачи
+/task ID — информация о задаче
 /report — сдать отчёт
 /rating — рейтинг
 /achievements — достижения
 /notifications — уведомления
 
-Отделы (после вступления):
-/dept_admin /dept_dev /dept_design
-/dept_pr /dept_control /dept_support /dept_hr
-
-Задачи:
-/newtask — создать задачу (руководитель)
-/task ID — информация о задаче
-
 Поддержка:
-/ticket тема | описание — создать обращение
+/ticket — создать обращение
 /tickets — мои обращения
 
 Кадры:
 /apply — подать заявку на работу
+""".strip())
+
+
+@bot.message_handler(commands=["ahelp"])
+def cmd_ahelp(m):
+    if not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Команда только для владельца.")
+    bot.send_message(m.chat.id, f"""
+🛡 АДМИН-КОМАНДЫ JARVIS {VERSION}
 
 Владелец:
-/backup /adminstats /ban ID /unban ID
-/hire ID dept role — принять
-/fire ID dept — уволить
+/backup — сделать бэкап базы
+/adminstats — общая статистика
+/ban ID — забанить пользователя
+/unban ID — разбанить
+/hire USER_ID dept role — принять/назначить
+/fire USER_ID dept — снять с должности
+
+Создание задач (руководитель отдела):
+/newtask dept USER_ID priority | заголовок | описание | YYYY-MM-DD
+
+Управление в группах:
+/auto_on — автообщение
+/auto_off — только по упоминанию
+/bot_on — включить бота в чате
+/bot_off — выключить бота в чате
+/clearlearning — очистить обучение в чате
+
+Коды отделов:
+admin, dev, design, pr, control, support, hr
+
+Роли:
+leader, deputy, employee
 """.strip())
 
 
@@ -1240,14 +1205,20 @@ def cmd_ai(m):
     thinking = bot.reply_to(m, "🧠 Думаю...")
     try:
         answer = ai_message(m, text)
-        bot.delete_message(m.chat.id, thinking.message_id)
+        try:
+            bot.delete_message(m.chat.id, thinking.message_id)
+        except Exception:
+            pass
         send_long(m.chat.id, answer, m.message_id)
     except Exception as e:
         print("[GROQ ERROR]", repr(e))
-        bot.edit_message_text(
-            "⚠️ Ошибка Groq:\n" + str(e)[:3000],
-            m.chat.id, thinking.message_id
-        )
+        try:
+            bot.edit_message_text(
+                "⚠️ Ошибка Groq:\n" + str(e)[:3000],
+                m.chat.id, thinking.message_id
+            )
+        except Exception:
+            bot.reply_to(m, "⚠️ Ошибка Groq:\n" + str(e)[:3000])
 
 
 @bot.message_handler(commands=["personality"])
@@ -1383,6 +1354,8 @@ def cmd_top(m):
     text = "🏆 ТОП АКТИВНОСТИ\n\n"
     for i, r in enumerate(rows, 1):
         text += f"{i}. {r['first_name']} — {r['total']}\n"
+    if not rows:
+        text += "Пока пусто."
     bot.send_message(m.chat.id, text)
 
 
@@ -1483,7 +1456,9 @@ def cmd_mytasks(m):
 def cmd_report(m):
     text = m.text.partition(" ")[2].strip()
     if not text:
-        return bot.reply_to(m, "Использование:\n/report daily|weekly отдел текст_отчёта\n\nПример:\n/report daily dev Сделал 3 задачи, исправил баги.")
+        return bot.reply_to(m,
+            "Использование:\n/report daily|weekly отдел текст_отчёта\n\n"
+            "Пример:\n/report daily dev Сделал 3 задачи, исправил баги.")
     parts = text.split(maxsplit=2)
     if len(parts) < 3:
         return bot.reply_to(m, "Нужно: тип (daily/weekly) + код отдела + текст")
@@ -1545,7 +1520,7 @@ def cmd_notifications(m):
 @bot.message_handler(commands=["hire"])
 def cmd_hire(m):
     if not is_owner(m.from_user.id):
-        return bot.reply_to(m, "⛔ Только владелец (или используйте меню руководителя).")
+        return bot.reply_to(m, "⛔ Только владелец.")
     parts = m.text.split()
     if len(parts) < 4:
         return bot.reply_to(m, "/hire USER_ID dept role\nrole: leader|deputy|employee")
@@ -1610,7 +1585,9 @@ def cmd_tickets(m):
 def cmd_apply(m):
     text = m.text.partition(" ")[2].strip()
     if not text or "|" not in text:
-        return bot.reply_to(m, "/apply ФИО | возраст | опыт | навыки | код_отдела\n\nПример:\n/apply Иван Иванов | 25 | 2 года Python | Django, SQL | dev")
+        return bot.reply_to(m,
+            "/apply ФИО | возраст | опыт | навыки | код_отдела\n\n"
+            "Пример:\n/apply Иван Иванов | 25 | 2 года Python | Django, SQL | dev")
     parts = [p.strip() for p in text.split("|")]
     if len(parts) < 5:
         return bot.reply_to(m, "Нужно 5 частей через |")
@@ -1644,10 +1621,42 @@ def cmd_task(m):
 Создатель: {format_user(task['creator_id'])}
 Исполнитель: {format_user(task['assignee_id'])}
 Срок: {task['deadline'] or '—'}
-Создана: {task['created'][:16]}
+Создана: {task['created'][:16] if task['created'] else '—'}
 """
     bot.send_message(m.chat.id, text, reply_markup=task_status_keyboard(task["id"], m.from_user.id, task))
-    # =====================================================
+
+
+@bot.message_handler(commands=["newtask"])
+def cmd_newtask(m):
+    text = m.text.partition(" ")[2].strip()
+    if "|" not in text:
+        return bot.reply_to(m, "Формат:\n/newtask dept USER_ID priority | заголовок | описание | YYYY-MM-DD")
+    head, rest = text.split("|", 1)
+    parts = head.split()
+    if len(parts) < 3:
+        return bot.reply_to(m, "Нужно: dept USER_ID priority")
+    dept, uid_s, prio = parts[0].lower(), parts[1], parts[2].lower()
+    if dept not in DEPARTMENTS:
+        return bot.reply_to(m, "Неизвестный отдел")
+    if not is_leader_or_deputy(m.from_user.id, dept) and not is_owner(m.from_user.id):
+        return bot.reply_to(m, "⛔ Только руководитель/заместитель отдела или владелец.")
+    if prio not in PRIORITIES:
+        return bot.reply_to(m, "Приоритет: low medium high critical")
+    try:
+        assignee = int(uid_s)
+    except ValueError:
+        return bot.reply_to(m, "USER_ID должен быть числом")
+    rest_parts = [p.strip() for p in rest.split("|")]
+    if len(rest_parts) < 2:
+        return bot.reply_to(m, "Нужны заголовок и описание")
+    title = rest_parts[0]
+    description = rest_parts[1] if len(rest_parts) > 1 else ""
+    deadline = rest_parts[2] if len(rest_parts) > 2 else None
+    tid = create_task(dept, title, description, m.from_user.id, assignee, prio, deadline)
+    bot.reply_to(m, f"✅ Задача #{tid} создана и назначена.")
+
+
+# =====================================================
 # CALLBACKS
 # =====================================================
 
@@ -1661,7 +1670,6 @@ def callbacks(c):
     get_chat(chat_id)
 
     try:
-        # ----- OLD MENU -----
         if data == "menu":
             bot.edit_message_text("🤖 JARVIS — ПАНЕЛЬ", chat_id, c.message.message_id, reply_markup=main_keyboard())
 
@@ -1690,13 +1698,50 @@ def callbacks(c):
             bot.answer_callback_query(c.id)
 
         elif data == "profile":
-            # reuse command logic
             bot.answer_callback_query(c.id)
-            cmd_profile(type("obj", (object,), {"from_user": c.from_user, "chat": c.message.chat, "text": "/profile"}))
+            u = get_user(c.from_user)
+            members = query(
+                "SELECT department,role FROM department_members WHERE user_id=?",
+                (uid,), True
+            )
+            depts = ""
+            for mem in members:
+                depts += f"• {DEPARTMENTS.get(mem['department'], (mem['department'],))[0]} — {ROLES.get(mem['role'], mem['role'])}\n"
+            if not depts:
+                depts = "Не состоит в отделах\n"
+            rating = query("SELECT * FROM ratings WHERE user_id=?", (uid,), True)
+            pts = rating[0]["points"] if rating else 0
+            done = rating[0]["tasks_done"] if rating else 0
+            bot.send_message(chat_id, f"""
+👤 ПРОФИЛЬ JARVIS
+
+ID: {u['user_id']}
+Имя: {u['first_name']}
+Username: @{u['username'] or 'нет'}
+Запросов: {u['requests']}
+Характер: {PERSONALITIES.get(u['personality'], PERSONALITIES['normal'])[0]}
+Память: {'Есть' if u['memory'] else 'Нет'}
+
+🏢 Отделы:
+{depts}
+🏆 Очки: {pts}
+✅ Задач выполнено: {done}
+""")
 
         elif data == "stats":
             bot.answer_callback_query(c.id)
-            cmd_stats(type("obj", (object,), {"from_user": c.from_user, "chat": c.message.chat}))
+            u = get_user(c.from_user)
+            total = query(
+                "SELECT COUNT(*) AS n FROM history WHERE user_id=?",
+                (uid,), True
+            )[0]["n"]
+            bot.send_message(chat_id, f"""
+📊 СТАТИСТИКА
+
+Запросы: {u['requests']}
+Сообщения истории: {total}
+Версия: {VERSION}
+""")
 
         elif data == "settings":
             bot.edit_message_text("⚙️ НАСТРОЙКИ", chat_id, c.message.message_id, reply_markup=settings_keyboard())
@@ -1720,7 +1765,6 @@ def callbacks(c):
         elif data == "chat":
             bot.answer_callback_query(c.id, "Напиши /ai и свой вопрос.")
 
-        # ----- DEPARTMENTS -----
         elif data == "departments":
             bot.edit_message_text("🏢 ОТДЕЛЫ JARVIS", chat_id, c.message.message_id, reply_markup=departments_keyboard())
 
@@ -1743,7 +1787,8 @@ def callbacks(c):
 Выполнено: {done_t}
 Отчётов принято: {reps}
 """
-            bot.edit_message_text(text, chat_id, c.message.message_id, reply_markup=department_menu_keyboard(code, uid))
+            bot.edit_message_text(text, chat_id, c.message.message_id,
+                                  reply_markup=department_menu_keyboard(code, uid))
 
         elif data.startswith("deptmem_"):
             code = data[8:]
@@ -1836,11 +1881,9 @@ def callbacks(c):
             bot.send_message(chat_id, f"""
 👤 УПРАВЛЕНИЕ КАДРАМИ — {DEPARTMENTS.get(code, (code,))[0]}
 
-Команды (владелец / руководитель):
+Команды (владелец):
 /hire USER_ID {code} leader|deputy|employee
 /fire USER_ID {code}
-
-Также можно использовать кнопки участников.
 """)
             bot.answer_callback_query(c.id)
 
@@ -1851,15 +1894,14 @@ def callbacks(c):
             bot.send_message(chat_id, f"""
 ➕ СОЗДАНИЕ ЗАДАЧИ ({DEPARTMENTS.get(code, (code,))[0]})
 
-Отправьте сообщение в формате:
-/newtask {code} USER_ID приоритет | заголовок | описание | срок(YYYY-MM-DD)
+Отправьте:
+/newtask {code} USER_ID priority | заголовок | описание | YYYY-MM-DD
 
 Пример:
-/newtask {code} 123456789 high | Исправить баг | Описание бага | 2026-11-10
+/newtask {code} 123456789 high | Исправить баг | Описание | 2026-11-15
 """)
             bot.answer_callback_query(c.id)
 
-        # ----- TASK ACTIONS -----
         elif data.startswith("task_accept_"):
             tid = int(data.split("_")[-1])
             task = get_task(tid)
@@ -1867,8 +1909,11 @@ def callbacks(c):
                 return bot.answer_callback_query(c.id, "Не ваша задача.", show_alert=True)
             update_task_status(tid, "accepted", uid)
             bot.answer_callback_query(c.id, "Задача принята.")
-            bot.edit_message_reply_markup(chat_id, c.message.message_id,
-                                          reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            try:
+                bot.edit_message_reply_markup(chat_id, c.message.message_id,
+                                              reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            except Exception:
+                pass
 
         elif data.startswith("task_progress_"):
             tid = int(data.split("_")[-1])
@@ -1877,8 +1922,11 @@ def callbacks(c):
                 return bot.answer_callback_query(c.id, "Не ваша задача.", show_alert=True)
             update_task_status(tid, "in_progress", uid)
             bot.answer_callback_query(c.id, "В работе.")
-            bot.edit_message_reply_markup(chat_id, c.message.message_id,
-                                          reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            try:
+                bot.edit_message_reply_markup(chat_id, c.message.message_id,
+                                              reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            except Exception:
+                pass
 
         elif data.startswith("task_submit_"):
             tid = int(data.split("_")[-1])
@@ -1887,8 +1935,11 @@ def callbacks(c):
                 return bot.answer_callback_query(c.id, "Не ваша задача.", show_alert=True)
             update_task_status(tid, "review", uid)
             bot.answer_callback_query(c.id, "Отправлено на проверку.")
-            bot.edit_message_reply_markup(chat_id, c.message.message_id,
-                                          reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            try:
+                bot.edit_message_reply_markup(chat_id, c.message.message_id,
+                                              reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            except Exception:
+                pass
 
         elif data.startswith("task_done_"):
             tid = int(data.split("_")[-1])
@@ -1897,8 +1948,11 @@ def callbacks(c):
                 return bot.answer_callback_query(c.id, "Нет прав.", show_alert=True)
             update_task_status(tid, "done", uid)
             bot.answer_callback_query(c.id, "Задача принята!")
-            bot.edit_message_reply_markup(chat_id, c.message.message_id,
-                                          reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            try:
+                bot.edit_message_reply_markup(chat_id, c.message.message_id,
+                                              reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            except Exception:
+                pass
 
         elif data.startswith("task_reject_"):
             tid = int(data.split("_")[-1])
@@ -1907,8 +1961,11 @@ def callbacks(c):
                 return bot.answer_callback_query(c.id, "Нет прав.", show_alert=True)
             update_task_status(tid, "rejected", uid)
             bot.answer_callback_query(c.id, "Задача отклонена.")
-            bot.edit_message_reply_markup(chat_id, c.message.message_id,
-                                          reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            try:
+                bot.edit_message_reply_markup(chat_id, c.message.message_id,
+                                              reply_markup=task_status_keyboard(tid, uid, get_task(tid)))
+            except Exception:
+                pass
 
         elif data.startswith("task_comments_"):
             tid = int(data.split("_")[-1])
@@ -1921,22 +1978,48 @@ def callbacks(c):
             bot.send_message(chat_id, text[:4000])
             bot.answer_callback_query(c.id)
 
-        # ----- OTHER MENUS -----
         elif data == "mytasks":
             bot.answer_callback_query(c.id)
-            cmd_mytasks(type("obj", (object,), {"from_user": c.from_user, "chat": c.message.chat, "reply_to": bot.reply_to}))
+            tasks = user_tasks(uid)
+            if not tasks:
+                bot.send_message(chat_id, "У вас нет активных задач.")
+            else:
+                text = "📋 МОИ ЗАДАЧИ\n\n"
+                for t in tasks:
+                    text += (f"#{t['id']} [{TASK_STATUSES.get(t['status'], t['status'])}] "
+                             f"{t['title']}\n")
+                bot.send_message(chat_id, text[:4000])
 
         elif data == "reports_menu":
-            bot.send_message(chat_id, "📝 Чтобы сдать отчёт используйте:\n/report daily|weekly код_отдела текст")
+            bot.send_message(chat_id, "📝 Чтобы сдать отчёт:\n/report daily|weekly код_отдела текст")
             bot.answer_callback_query(c.id)
 
         elif data == "rating":
             bot.answer_callback_query(c.id)
-            cmd_rating(type("obj", (object,), {"from_user": c.from_user, "chat": c.message.chat}))
+            rows = query("""
+                SELECT r.user_id, r.points, r.tasks_done, u.first_name
+                FROM ratings r JOIN users u ON u.user_id=r.user_id
+                ORDER BY r.points DESC LIMIT 15
+            """, fetch=True)
+            text = "🏆 РЕЙТИНГ JARVIS\n\n"
+            for i, r in enumerate(rows, 1):
+                text += f"{i}. {r['first_name']} — {r['points']} очков ({r['tasks_done']} задач)\n"
+            if not rows:
+                text += "Пока пусто."
+            bot.send_message(chat_id, text)
 
         elif data == "achievements":
             bot.answer_callback_query(c.id)
-            cmd_achievements(type("obj", (object,), {"from_user": c.from_user, "chat": c.message.chat, "reply_to": bot.reply_to}))
+            rows = query("""
+                SELECT * FROM achievements WHERE user_id=? ORDER BY id DESC LIMIT 20
+            """, (uid,), True)
+            if not rows:
+                bot.send_message(chat_id, "Достижений пока нет.")
+            else:
+                text = "🎖 ВАШИ ДОСТИЖЕНИЯ\n\n"
+                for a in rows:
+                    text += f"• {a['title']} (+{a['points']})\n  {a['description']}\n\n"
+                bot.send_message(chat_id, text[:4000])
 
         elif data == "support_list":
             if not is_in_department(uid, "support") and not is_owner(uid):
@@ -1980,42 +2063,7 @@ def callbacks(c):
 
 
 # =====================================================
-# NEW TASK COMMAND
-# =====================================================
-
-@bot.message_handler(commands=["newtask"])
-def cmd_newtask(m):
-    text = m.text.partition(" ")[2].strip()
-    # format: dept USER_ID priority | title | description | deadline
-    if "|" not in text:
-        return bot.reply_to(m, "Формат:\n/newtask dept USER_ID priority | заголовок | описание | YYYY-MM-DD")
-    head, rest = text.split("|", 1)
-    parts = head.split()
-    if len(parts) < 3:
-        return bot.reply_to(m, "Нужно: dept USER_ID priority")
-    dept, uid_s, prio = parts[0].lower(), parts[1], parts[2].lower()
-    if dept not in DEPARTMENTS:
-        return bot.reply_to(m, "Неизвестный отдел")
-    if not is_leader_or_deputy(m.from_user.id, dept) and not is_owner(m.from_user.id):
-        return bot.reply_to(m, "⛔ Только руководитель/заместитель отдела.")
-    if prio not in PRIORITIES:
-        return bot.reply_to(m, "Приоритет: low medium high critical")
-    try:
-        assignee = int(uid_s)
-    except ValueError:
-        return bot.reply_to(m, "USER_ID должен быть числом")
-    rest_parts = [p.strip() for p in rest.split("|")]
-    if len(rest_parts) < 2:
-        return bot.reply_to(m, "Нужны заголовок и описание")
-    title = rest_parts[0]
-    description = rest_parts[1] if len(rest_parts) > 1 else ""
-    deadline = rest_parts[2] if len(rest_parts) > 2 else None
-    tid = create_task(dept, title, description, m.from_user.id, assignee, prio, deadline)
-    bot.reply_to(m, f"✅ Задача #{tid} создана и назначена.")
-
-
-# =====================================================
-# MESSAGE HANDLER (old logic preserved)
+# MESSAGE HANDLER
 # =====================================================
 
 @bot.message_handler(
@@ -2036,7 +2084,6 @@ def handle_message(m):
     if not text:
         return
 
-    # Обученные ответы
     learned = query("""
         SELECT answer FROM learning
         WHERE chat_id=? AND LOWER(phrase)=LOWER(?)
@@ -2088,7 +2135,10 @@ def handle_message(m):
     try:
         thinking = bot.reply_to(m, "🧠 JARVIS думает...")
         answer = ai_message(m, text)
-        bot.delete_message(m.chat.id, thinking.message_id)
+        try:
+            bot.delete_message(m.chat.id, thinking.message_id)
+        except Exception:
+            pass
         send_long(m.chat.id, answer, m.message_id)
     except Exception as e:
         print("[AI ERROR]", repr(e))
