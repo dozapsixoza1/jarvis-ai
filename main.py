@@ -24,7 +24,7 @@ from telebot import TeleBot, types
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_ID = int(os.getenv("OWNER_ID", "8675927241"))
 
 BOT_NAME = "JARVIS"
 VERSION = "3.0"
